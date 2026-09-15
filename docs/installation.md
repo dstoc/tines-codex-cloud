@@ -55,6 +55,15 @@ Build a source distribution and wheel from a tagged or otherwise reviewed
 commit. The version in `pyproject.toml` is the release identity; do not deploy
 an uncommitted checkout or an unpinned VCS URL.
 
+## Trigger a release
+
+Release Please watches commits merged into `main`. Use a release-bearing
+Conventional Commit such as `feat(release): publish the bridge release` when a
+reviewed change should create the next release pull request. Release Please
+updates `pyproject.toml`, `__version__`, `.release-please-manifest.json`, and
+`CHANGELOG.md`; do not edit those generated release files by hand just to
+trigger a release.
+
 ```sh
 python3 -m pip install --upgrade build
 python3 -m build --sdist --wheel
