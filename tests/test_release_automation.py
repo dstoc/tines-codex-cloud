@@ -68,5 +68,32 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertIn("not published\nto PyPI", installation)
 
 
+class ContinuousIntegrationWorkflowTests(unittest.TestCase):
+    def test_ci_workflow_is_staged_under_proposed_workflows(self) -> None:
+        workflow_path = ROOT / ".github" / "workflows-proposed" / "ci.yml"
+
+        self.assertTrue(workflow_path.is_file())
+        self.assertFalse((ROOT / ".github" / "workflows" / "ci.yml").exists())
+
+    def test_ci_workflow_tests_supported_python_versions_with_read_only_access(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows-proposed" / "ci.yml"
+        ).read_text()
+
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("push:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertRegex(workflow, r"branches:\s+- main")
+        self.assertIn('"3.11"', workflow)
+        self.assertIn('"3.12"', workflow)
+        self.assertIn('"3.13"', workflow)
+        self.assertIn("actions/checkout@v7", workflow)
+        self.assertIn("actions/setup-python@v7", workflow)
+        self.assertIn("PYTHONPATH=src python -m unittest discover -s tests -v", workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertNotIn("contents: write", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
