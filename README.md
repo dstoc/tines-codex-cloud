@@ -58,6 +58,30 @@ python3 -m pip install .
 tines-codex-cloud --help
 ```
 
+### Install a GitHub Release
+
+Releases are distributed as GitHub Release assets; this project is not
+published to PyPI. For a wheel downloaded from a release:
+
+```sh
+python -m pip install ./tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
+To install directly from a GitHub Release, replace `0.1.0` with the desired
+release version:
+
+```sh
+python -m pip install \
+  https://github.com/dstoc/tines-codex-cloud/releases/download/v0.1.0/tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
+For a CLI-oriented installation, `pipx` is also supported:
+
+```sh
+pipx install \
+  https://github.com/dstoc/tines-codex-cloud/releases/download/v0.1.0/tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
 For the supported runner-host layout, version pinning, prerequisite checks,
 service PATH behavior, upgrades, and rollback, see
 [docs/installation.md](docs/installation.md).
@@ -229,6 +253,13 @@ The project has no runtime dependencies. Run its test suite with:
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
+
+Development installs are also supported from a source checkout:
+
+```sh
+python -m pip install .
+python -m pip install -e .
 ```
 
 The integration tests prepend `tests/fixtures` to `PATH`, so the fake

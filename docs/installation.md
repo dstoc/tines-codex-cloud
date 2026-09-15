@@ -24,6 +24,31 @@ The bridge does not install or update either CLI. This keeps provider
 authentication and the Tines runner's own CLI lifecycle under their respective
 administrators.
 
+## Install a GitHub Release
+
+The package is distributed through GitHub Release assets and is not published
+to PyPI. Download the wheel for the required version, then install the exact
+file into the target environment:
+
+```sh
+python -m pip install ./tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
+The wheel can also be installed directly from the GitHub Release URL. Replace
+`0.1.0` in both the tag and filename with the desired version:
+
+```sh
+python -m pip install \
+  https://github.com/dstoc/tines-codex-cloud/releases/download/v0.1.0/tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
+For CLI-oriented installations, `pipx` is an alternative:
+
+```sh
+pipx install \
+  https://github.com/dstoc/tines-codex-cloud/releases/download/v0.1.0/tines_codex_cloud-0.1.0-py3-none-any.whl
+```
+
 ## Build and pin a release
 
 Build a source distribution and wheel from a tagged or otherwise reviewed
