@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "python",
+  "versioning-strategy": "default",
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "package-name": "tines-codex-cloud",
+      "changelog-path": "CHANGELOG.md"
+    }
+  }
+}
