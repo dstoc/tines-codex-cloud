@@ -26,6 +26,8 @@ TinesCommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 MAX_CLOUD_PROMPT_BYTES = 256 * 1024
 MAX_SKILL_DESCRIPTION_CHARS = 512
+MAX_MODEL_ID_CHARS = 256
+CLOUD_DEFAULT_MODEL = "provider/default configuration"
 
 CONTEXT_ITEM_ID_PATTERN = re.compile(r"^ctx_[A-Za-z0-9_-]+$")
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
@@ -95,6 +97,77 @@ class SkillMetadata:
     name: str
     description: str | None
     file_count: int
+
+
+@dataclass(frozen=True)
+class CloudLaunchConfiguration:
+    """Launch settings and model-routing metadata for one Cloud task.
+
+    ``resolved_model`` is selected by Tines before the custom runner starts.
+    The current Codex Cloud command has no per-task model option, so it is
+    recorded as metadata but is not included in ``codex_exec_arguments``.
+    Keeping argument construction here gives a single, explicit forwarding
+    point when that provider capability becomes available.
+    """
+
+    environment: str
+    branch: str | None = None
+    resolved_model: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "resolved_model", _validate_model_id(self.resolved_model))
+
+    @property
+    def delivered_model(self) -> str:
+        """Describe the model source currently used by Codex Cloud."""
+
+        return CLOUD_DEFAULT_MODEL
+
+    @property
+    def requested_model(self) -> str | None:
+        """Alias that makes the Tines-side meaning clear to callers."""
+
+        return self.resolved_model
+
+    def codex_exec_arguments(self) -> list[str]:
+        """Build the current ``codex cloud exec`` arguments.
+
+        Do not add ``resolved_model`` here until ``codex cloud exec`` exposes
+        a supported per-task model option. The model is not a prompt setting.
+        """
+
+        arguments = ["cloud", "exec", "--env", self.environment]
+        if self.branch is not None:
+            arguments.extend(["--branch", self.branch])
+        arguments.append("-")
+        return arguments
+
+    def diagnostic_metadata(self) -> dict[str, str | None]:
+        """Return non-secret metadata suitable for diagnostics or bookkeeping."""
+
+        return {
+            "cloud_environment": self.environment,
+            "branch": self.branch,
+            "requested_model": self.resolved_model,
+            "delivered_model": self.delivered_model,
+        }
+
+
+def _validate_model_id(model: str | None) -> str | None:
+    """Validate and normalize a Tines-resolved model for safe diagnostics."""
+
+    if model is None:
+        return None
+    if not isinstance(model, str):
+        raise CloudCommandError("model must be a string")
+    normalized = model.strip()
+    if not normalized:
+        raise CloudCommandError("model must not be empty")
+    if len(normalized) > MAX_MODEL_ID_CHARS:
+        raise CloudCommandError("model exceeds the size limit")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in normalized):
+        raise CloudCommandError("model must not contain control characters")
+    return normalized
 
 
 SUPERVISOR_CONTRACT_HEADING = "## The contract"
@@ -645,6 +718,7 @@ class CloudRunner:
         branch: str | None = None,
         poll_interval: float = 5.0,
         *,
+        model: str | None = None,
         codex_binary: str = "codex",
         run_command: CommandRunner = subprocess.run,
         tines_binary: str = "tines",
@@ -659,6 +733,15 @@ class CloudRunner:
         self.environment = environment
         self.branch = branch
         self.poll_interval = poll_interval
+        self.launch_configuration = CloudLaunchConfiguration(
+            environment=environment,
+            branch=branch,
+            resolved_model=model,
+        )
+        # Keep the short attribute available to callers that only need the
+        # Tines-resolved value; launch_configuration remains the source of
+        # truth for command construction and diagnostics.
+        self.model = self.launch_configuration.resolved_model
         self.codex_binary = codex_binary
         self.run_command = run_command
         self.tines_binary = tines_binary
@@ -666,6 +749,12 @@ class CloudRunner:
         self.sleep = sleep
         self.output = output
         self.last_status: CloudStatus | None = None
+
+    @property
+    def launch_metadata(self) -> dict[str, str | None]:
+        """Return safe metadata describing what the bridge will launch."""
+
+        return self.launch_configuration.diagnostic_metadata()
 
     def _safe_environment(self) -> dict[str, str]:
         child_environment = os.environ.copy()
@@ -783,6 +872,11 @@ class CloudRunner:
             )
             lines = ["Codex Cloud task did not complete successfully.", f"Task: {task_reference}"]
             lines.append(f"Reason: {reason or 'Codex Cloud reported a failure without a reason.'}")
+        if self.model is not None:
+            lines.append(
+                "Model: requested/resolved by Tines: "
+                f"{self.model}; delivered to Codex Cloud: {self.launch_configuration.delivered_model}."
+            )
         lines.append(
             "The bridge records the Cloud task result; the Cloud agent owns the implementation "
             "summary, work-product/PR artifacts, and issue transition."
@@ -792,11 +886,7 @@ class CloudRunner:
             self._warn_integration_failure("record the Cloud task result on the Tines issue")
 
     def submit(self, prompt: str) -> str:
-        arguments = ["cloud", "exec", "--env", self.environment]
-        if self.branch is not None:
-            arguments.extend(["--branch", self.branch])
-        arguments.append("-")
-        result = self._execute(arguments, input_text=prompt)
+        result = self._execute(self.launch_configuration.codex_exec_arguments(), input_text=prompt)
         if result.returncode != 0:
             raise CloudCommandError(f"codex cloud exec failed with exit code {result.returncode}")
         task_reference = extract_task_reference(result.stdout)
@@ -830,6 +920,13 @@ class CloudRunner:
         """Submit and synchronously wait for the Cloud task."""
 
         issue_ref = issue_ref or extract_issue_reference(prompt)
+        if self.model is not None:
+            print(
+                "Cloud launch metadata: requested/resolved by Tines: "
+                f"{self.model}; delivered to Codex Cloud: {self.launch_configuration.delivered_model}.",
+                file=self.output,
+                flush=True,
+            )
         task_reference = self.submit(prompt)
         self._record_task_link(issue_ref, task_reference)
         print("Cloud task submitted; polling until completion.", file=self.output, flush=True)

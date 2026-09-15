@@ -98,11 +98,14 @@ tines-codex-cloud run \
   --env example \
   --prompt-file /path/to/prompt.md \
   --branch main \
+  --model gpt-5.6-sol \
   --poll-interval 5
 ```
 
 `--branch` is optional; omit it when the Cloud environment's configured base
-branch should be used. The wrapper requires these environment variables:
+branch should be used. `--model` is optional and accepts the concrete model
+resolved by Tines for the custom runner. The wrapper requires these environment
+variables:
 
 ```text
 TINES_API_URL
@@ -156,6 +159,33 @@ The runner daemon supplies `TINES_API_URL` and the ephemeral
 contents to Codex Cloud rather than relying on the local Tines workspace being
 available in Cloud.
 
+Custom runners do not have a built-in tier-to-model table, so configure the
+mapping explicitly before using the `{model}` placeholder:
+
+```sh
+tines runners tiers cloud-example \
+  --set smartest=gpt-6-astra \
+  --set balanced=gpt-5.6-sol \
+  --set cheapest=gpt-5.6-luna \
+  --default balanced
+
+tines runner install \
+  --name cloud-example \
+  --harness custom \
+  --command '/path/to/tines-codex-cloud run \
+    --env example \
+    --prompt-file {prompt_file} \
+    --model {model}'
+```
+
+The bridge records the `--model` value as `requested/resolved by Tines` in
+safe launch diagnostics and result metadata. The current `codex cloud exec`
+command does not expose a per-task model option, so the bridge does not add it
+to the Cloud command or agent prompt. It records the separate delivery value
+as `provider/default configuration`; Cloud continues using the model configured
+by the environment or provider default until Codex supports a per-task
+override.
+
 ## Run lifecycle
 
 1. Tines launches the custom command with its generated prompt file and
@@ -172,7 +202,9 @@ available in Cloud.
    `tines context show <context-item-id> --json`. The contract and
    issue/workflow block are preserved unchanged.
 3. The bridge submits that prompt to `codex cloud exec` with the selected
-   environment and optional branch.
+   environment and optional branch. If Tines resolved a model, it is retained
+   in launch metadata; it is not sent as a current Cloud CLI argument or
+   prompt instruction because the command has no per-task model control.
 4. It extracts the returned task URL and polls `codex cloud status` in the
    foreground. `PENDING` and other recognized in-progress states continue
    polling; `READY` succeeds and `ERROR` fails.

@@ -23,6 +23,7 @@ class FakeCodexIntegrationTests(unittest.TestCase):
         scenario: str,
         *,
         branch: str | None = None,
+        model: str | None = None,
         prompt: str = "original Tines prompt\n",
     ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -62,6 +63,8 @@ class FakeCodexIntegrationTests(unittest.TestCase):
             ]
             if branch is not None:
                 command.extend(["--branch", branch])
+            if model is not None:
+                command.extend(["--model", model])
 
             result = subprocess.run(
                 command,
@@ -115,6 +118,24 @@ class FakeCodexIntegrationTests(unittest.TestCase):
         self.assertEqual(submission["tines_api_url"], self.api_url)
         self.assertEqual(status["operation"], "status")
         self.assertEqual(status["args"], ["cloud", "status", TASK_URL])
+
+    def test_resolved_model_is_diagnostic_metadata_only(self) -> None:
+        result, records = self.run_bridge(
+            "successful-submission",
+            model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "requested/resolved by Tines: gpt-5.6-sol; delivered to Codex Cloud: provider/default configuration",
+            result.stdout,
+        )
+        self.assertEqual(
+            records[0]["args"],
+            ["cloud", "exec", "--env", "integration", "-"],
+        )
+        self.assertNotIn("gpt-5.6-sol", str(records[0]["args"]))
+        self.assertNotIn("gpt-5.6-sol", str(records[0]["stdin"]))
 
     def test_pending_to_ready_polls_until_ready(self) -> None:
         result, records = self.run_bridge("pending-to-ready")

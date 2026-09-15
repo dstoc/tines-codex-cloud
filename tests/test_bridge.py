@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from tines_codex_cloud.bridge import (
     CloudCommandError,
+    CloudLaunchConfiguration,
     CloudRunner,
     adapt_supervisor_prompt,
     build_cloud_prompt,
@@ -73,6 +74,54 @@ class SkillContextCommand:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_launch_configuration_keeps_resolved_model_out_of_current_exec_argv(self) -> None:
+        configuration = CloudLaunchConfiguration(
+            environment="example",
+            branch="main",
+            resolved_model="gpt-5.6-sol",
+        )
+
+        self.assertEqual(
+            configuration.codex_exec_arguments(),
+            ["cloud", "exec", "--env", "example", "--branch", "main", "-"],
+        )
+        self.assertEqual(
+            configuration.diagnostic_metadata(),
+            {
+                "cloud_environment": "example",
+                "branch": "main",
+                "requested_model": "gpt-5.6-sol",
+                "delivered_model": "provider/default configuration",
+            },
+        )
+
+    def test_launch_configuration_supports_omitting_model(self) -> None:
+        configuration = CloudLaunchConfiguration(environment="example")
+
+        self.assertIsNone(configuration.requested_model)
+        self.assertIsNone(configuration.diagnostic_metadata()["requested_model"])
+
+    def test_cloud_runner_records_model_without_adding_it_to_exec_argv(self) -> None:
+        fake = FakeCodex(["READY"])
+        output = io.StringIO()
+        runner = CloudRunner("example", model="gpt-5.6-sol", run_command=fake, output=output)
+
+        self.assertEqual(runner.run("prompt"), 0)
+        self.assertEqual(
+            fake.calls[0][0],
+            ["codex", "cloud", "exec", "--env", "example", "-"],
+        )
+        self.assertNotIn("gpt-5.6-sol", fake.calls[0][0])
+        self.assertIn(
+            "requested/resolved by Tines: gpt-5.6-sol; delivered to Codex Cloud: provider/default configuration",
+            output.getvalue(),
+        )
+        self.assertEqual(runner.launch_metadata["requested_model"], "gpt-5.6-sol")
+
+    def test_cloud_runner_rejects_unsafe_model_diagnostic_values(self) -> None:
+        with self.assertRaisesRegex(CloudCommandError, "control characters"):
+            CloudRunner("example", model="gpt-5.6-sol\nnext")
+
     def test_check_prerequisites_runs_only_non_mutating_version_and_help_commands(self) -> None:
         calls: list[list[str]] = []
 
@@ -433,6 +482,7 @@ Fix the reported behavior.
         ):
             runner = CloudRunner(
                 "example",
+                model="gpt-5.6-sol",
                 run_command=codex,
                 run_tines_command=tines,
                 sleep=lambda _: None,
@@ -456,6 +506,10 @@ Fix the reported behavior.
         self.assertIn("completed successfully", comment)
         self.assertIn("Summary: Tests passed", comment)
         self.assertIn("https://github.com/acme/app/pull/42", comment)
+        self.assertIn(
+            "Model: requested/resolved by Tines: gpt-5.6-sol; delivered to Codex Cloud: provider/default configuration.",
+            comment,
+        )
         self.assertNotIn("secret", comment)
         self.assertEqual(tines.calls[0][1]["env"]["TINES_API_KEY"], "secret")
         self.assertNotIn("TINES_API_KEY", codex.calls[0][1]["env"])

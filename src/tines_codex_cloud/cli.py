@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--prompt-file", required=True, help="path to the Tines-generated prompt")
     run_parser.add_argument("--branch", help="optional branch for the Cloud task")
     run_parser.add_argument(
+        "--model",
+        help="Tines-resolved model ID to record for the Cloud task",
+    )
+    run_parser.add_argument(
         "--poll-interval",
         type=float,
         default=5.0,
@@ -74,7 +78,7 @@ def run_command(args: argparse.Namespace) -> int:
         branch=args.branch,
         skill_metadata=skill_metadata,
     )
-    runner = CloudRunner(args.env, args.branch, args.poll_interval)
+    runner = CloudRunner(args.env, args.branch, args.poll_interval, model=args.model)
     return runner.run(cloud_prompt, issue_ref=issue_ref)
 
 

@@ -53,6 +53,46 @@ class CliTests(unittest.TestCase):
         )
         runner.run.assert_called_once_with("cloud prompt", issue_ref="demo/7")
 
+    def test_run_accepts_tines_resolved_model_and_passes_it_to_cloud_runner(self) -> None:
+        runner = Mock()
+        runner.run.return_value = 0
+
+        with patch(
+            "tines_codex_cloud.cli.required_tines_environment",
+            return_value=("https://tines.example", "ephemeral-key"),
+        ), patch(
+            "tines_codex_cloud.cli.read_prompt",
+            return_value="## Issue: demo/7 — review\n",
+        ), patch(
+            "tines_codex_cloud.cli.fetch_skill_metadata",
+            return_value=(),
+        ), patch(
+            "tines_codex_cloud.cli.build_cloud_prompt",
+            return_value="cloud prompt",
+        ), patch(
+            "tines_codex_cloud.cli.CloudRunner",
+            return_value=runner,
+        ) as cloud_runner:
+            status = main(
+                [
+                    "run",
+                    "--env",
+                    "example",
+                    "--prompt-file",
+                    "/tmp/prompt.md",
+                    "--model",
+                    "gpt-5.6-sol",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        cloud_runner.assert_called_once_with(
+            "example",
+            None,
+            5.0,
+            model="gpt-5.6-sol",
+        )
+
     def test_doctor_reports_checks_and_returns_failure_when_one_is_missing(self) -> None:
         checks = [
             PrerequisiteCheck("Codex CLI", ("codex", "--version"), True, "codex 1.0"),
