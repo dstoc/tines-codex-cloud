@@ -183,8 +183,8 @@ environment secret is not sufficient.
   Cloud task exit code, and a provider's full transcript or diff is not copied
   into Tines. Use the task URL for provider details and the agent-created PR
   artifact for the reviewable diff.
-- Integration tests use mocked command execution; no real Codex Cloud task is
-  created by the test suite.
+- Integration tests use the tracked `tests/fixtures/codex` executable; no real
+  Codex Cloud task is created by the test suite.
 - Release packaging and runner-host upgrade/rollback procedures are documented
   in [docs/installation.md](docs/installation.md).
 
@@ -205,3 +205,7 @@ The project has no runtime dependencies. Run its test suite with:
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+The integration tests prepend `tests/fixtures` to `PATH`, so the fake
+executable receives the same arguments and prompt stdin as the real `codex`
+command without making a network request.
