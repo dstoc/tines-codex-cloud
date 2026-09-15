@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from math import isfinite
+from pathlib import Path
 
 from . import __version__
 from .bridge import (
@@ -42,7 +43,12 @@ def run_command(args: argparse.Namespace) -> int:
         raise CloudCommandError("--poll-interval must be a finite, non-negative number")
     api_url, api_key = required_tines_environment()
     original_prompt = read_prompt(args.prompt_file)
-    cloud_prompt = build_cloud_prompt(original_prompt, api_url, api_key)
+    cloud_prompt = build_cloud_prompt(
+        original_prompt,
+        api_url,
+        api_key,
+        skill_root=Path(args.prompt_file).parent / "skills",
+    )
     runner = CloudRunner(args.env, args.branch, args.poll_interval)
     return runner.run(cloud_prompt)
 

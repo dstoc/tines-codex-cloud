@@ -3,15 +3,20 @@ from __future__ import annotations
 import io
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tines_codex_cloud.bridge import (
     CloudCommandError,
     CloudRunner,
+    append_forwarded_skills,
     build_cloud_prompt,
+    extract_relevant_skill_names,
     extract_status,
     extract_task_reference,
+    read_relevant_skills,
     required_tines_environment,
 )
 
@@ -37,6 +42,86 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("export TINES_API_URL=https://tines.example/api", prompt)
         self.assertIn("export TINES_API_KEY='key'\"'\"'with-quote'", prompt)
         self.assertIn("Tines work", prompt)
+
+    def test_extract_relevant_skill_names_uses_the_generated_skill_index(self) -> None:
+        prompt = """### Skills
+
+- Skill "review-checklist" (issue demo/1): read `skills/review-checklist/SKILL.md` when this applies.
+- Skill "release" (project Demo): read `skills/release/SKILL.md` when this applies.
+
+The issue can mention skills/review-checklist/SKILL.md in ordinary prose too.
+"""
+
+        self.assertEqual(
+            extract_relevant_skill_names(prompt),
+            ("review-checklist", "release"),
+        )
+
+    def test_build_cloud_prompt_forwards_selected_skill_files_with_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills"
+            (root / "review-checklist" / "nested").mkdir(parents=True)
+            (root / "unrelated").mkdir()
+            (root / "review-checklist" / "SKILL.md").write_text("Review safely.\n", encoding="utf-8")
+            (root / "review-checklist" / "nested" / "guide.txt").write_text(
+                "Nested guide\n", encoding="utf-8"
+            )
+            (root / "unrelated" / "SKILL.md").write_text("Do not include me\n", encoding="utf-8")
+            original = (
+                "### Skills\n\n"
+                '- Skill "review-checklist" (issue demo/1): read `skills/review-checklist/SKILL.md` '
+                "when this applies.\n"
+            )
+
+            prompt = build_cloud_prompt(
+                original,
+                "https://tines.example/api",
+                "ephemeral-key",
+                skill_root=root,
+            )
+
+        self.assertIn("## Forwarded Tines skill files", prompt)
+        self.assertIn("### skills/review-checklist/SKILL.md", prompt)
+        self.assertIn("### skills/review-checklist/nested/guide.txt", prompt)
+        self.assertIn("Review safely.", prompt)
+        self.assertIn("Nested guide", prompt)
+        self.assertNotIn("Do not include me", prompt)
+        self.assertLess(prompt.index(original), prompt.index("## Forwarded Tines skill files"))
+
+    def test_read_relevant_skills_fails_closed_on_secret_like_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills" / "unsafe"
+            root.mkdir(parents=True)
+            (root / "SKILL.md").write_text("export API_KEY=super-secret-value\n", encoding="utf-8")
+            prompt = '### Skills\n\n- Skill "unsafe" (issue demo/1): read `skills/unsafe/SKILL.md`.'
+
+            with self.assertRaisesRegex(CloudCommandError, "secret-like content"):
+                read_relevant_skills(Path(temporary) / "skills", prompt)
+
+    def test_build_cloud_prompt_enforces_the_cloud_prompt_size_limit(self) -> None:
+        with self.assertRaisesRegex(CloudCommandError, "exceeds the size limit"):
+            append_forwarded_skills("prompt", (("skills/a/SKILL.md", "content"),), max_prompt_bytes=10)
+
+    def test_missing_skills_directory_is_only_an_error_when_prompt_references_one(self) -> None:
+        prompt = build_cloud_prompt(
+            "No skill applies.\n",
+            "https://tines.example/api",
+            "ephemeral-key",
+            skill_root=Path("/path/that/does/not/exist"),
+        )
+        self.assertNotIn("Forwarded Tines skill files", prompt)
+
+    def test_read_relevant_skills_preserves_file_bytes_as_utf8_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "skills" / "docs"
+            root.mkdir(parents=True)
+            content = "accent: café\n"
+            (root / "SKILL.md").write_text(content, encoding="utf-8")
+            prompt = '### Skills\n\n- Skill "docs" (issue demo/1): read `skills/docs/SKILL.md`.'
+
+            skills = read_relevant_skills(Path(temporary) / "skills", prompt)
+
+        self.assertEqual(skills, (("skills/docs/SKILL.md", content),))
 
     def test_required_environment_does_not_accept_missing_values(self) -> None:
         with self.assertRaisesRegex(CloudCommandError, "must be set"):

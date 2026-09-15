@@ -19,6 +19,7 @@ Tines custom runner
     ▼
 tines-codex-cloud
     ├── adds a Cloud compatibility preamble
+    ├── forwards effective skills from skills/<name>/ when advertised by the prompt
     ├── codex cloud exec --env <environment> [--branch <branch>] -
     └── polls codex cloud status <task-url>
              │
@@ -29,7 +30,8 @@ tines-codex-cloud
 
 The Cloud environment owns repository selection and the checkout. The wrapper
 does not clone Tines repository context locally and does not infer an
-environment from the Tines prompt.
+environment from the Tines prompt. The local runner workspace is still used as
+a read-only source for the skill files materialized by Tines.
 
 ## Prerequisites
 
@@ -116,9 +118,10 @@ available in Cloud.
 1. Tines launches the custom command with its generated prompt file and
    ephemeral credentials in the environment.
 2. The bridge prepends a Cloud-specific compatibility override. It tells the
-   agent to export the supplied credentials, use the Cloud environment's
-   repository, and treat local Tines paths in the original prompt as
-   unavailable.
+   agent to export the supplied credentials and use the Cloud environment's
+   repository. It reads only the skills named in the prompt's generated
+   `### Skills` index, then appends their UTF-8 files under their original
+   `skills/<name>/...` paths.
 3. The bridge submits that prompt to `codex cloud exec` with the selected
    environment and optional branch.
 4. It extracts the returned task URL and polls `codex cloud status` in the
@@ -145,7 +148,10 @@ printing the key and removes it from the environment inherited by the local
   not implemented.
 - The local Tines supervisor prompt is only prefixed with an override; local
   runner-only instructions are still present.
-- Tines skills are not forwarded into Cloud.
+- Skill forwarding is bounded to 20 files and 100 KiB of selected skill data;
+  the complete Cloud prompt is bounded to 256 KiB. Paths must remain inside
+  the local skills workspace, files must be UTF-8 text, and secret-like
+  content causes a fail-closed error.
 - Environment, repository, and branch mapping is configured outside the
   wrapper.
 - The wrapper does not yet attach the Cloud task URL or a Cloud result summary
