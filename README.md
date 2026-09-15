@@ -18,7 +18,7 @@ Tines custom runner
     │ prompt_file + TINES_API_URL + TINES_API_KEY
     ▼
 tines-codex-cloud
-    ├── adds a Cloud compatibility preamble
+    ├── replaces the local-only preamble with a Cloud compatibility preamble
     ├── codex cloud exec --env <environment> [--branch <branch>] -
     └── polls codex cloud status <task-url>
              │
@@ -29,7 +29,9 @@ tines-codex-cloud
 
 The Cloud environment owns repository selection and the checkout. The wrapper
 does not clone Tines repository context locally and does not infer an
-environment from the Tines prompt.
+environment from the Tines prompt. The environment must therefore be
+configured for the repository that the Tines context describes; this bridge
+does not silently select among multiple repositories.
 
 ## Prerequisites
 
@@ -130,10 +132,11 @@ available in Cloud.
 
 1. Tines launches the custom command with its generated prompt file and
    ephemeral credentials in the environment.
-2. The bridge prepends a Cloud-specific compatibility override. It tells the
-   agent to export the supplied credentials, use the Cloud environment's
-   repository, and treat local Tines paths in the original prompt as
-   unavailable.
+2. The bridge recognizes the Tines supervisor envelope and replaces its
+   local-only authentication and workspace sections. It tells the agent to
+   export the supplied credentials, use the Cloud environment's repository,
+   and treat local Tines paths in the original prompt as unavailable. The
+   contract and issue/workflow block are preserved unchanged.
 3. The bridge submits that prompt to `codex cloud exec` with the selected
    environment and optional branch.
 4. It extracts the returned task URL and polls `codex cloud status` in the
@@ -174,8 +177,12 @@ environment secret is not sufficient.
 - Status parsing is intentionally simple text matching; transient status
   failures, retries, timeouts, cancellation, and killed-wrapper recovery are
   not implemented.
-- The local Tines supervisor prompt is only prefixed with an override; local
-  runner-only instructions are still present.
+- Recognized supervisor prompts are adapted by replacing the preamble. Older
+  or hand-written prompts without the `## The contract` marker use a
+  conservative additive compatibility wrapper instead.
+- The bridge does not yet validate that the selected Cloud environment matches
+  every repository attached to the Tines issue; mapping is explicit and
+  external.
 - Tines skills are not forwarded into Cloud.
 - Environment, repository, and branch mapping is configured outside the
   wrapper.
@@ -197,6 +204,9 @@ These concerns are tracked in the Tines project as separate follow-up issues:
 - Secure Tines credential delivery
 - Result and artifact integration
 - Testing with a fake `codex` executable
+
+See [docs/prompt-adaptation.md](docs/prompt-adaptation.md) for the design
+decision, resource contract, alternatives, and native Tines runner shape.
 
 ## Development
 

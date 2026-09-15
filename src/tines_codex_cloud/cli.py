@@ -59,7 +59,13 @@ def run_command(args: argparse.Namespace) -> int:
         raise CloudCommandError("--poll-interval must be a finite, non-negative number")
     api_url, api_key = required_tines_environment()
     original_prompt = read_prompt(args.prompt_file)
-    cloud_prompt = build_cloud_prompt(original_prompt, api_url, api_key)
+    cloud_prompt = build_cloud_prompt(
+        original_prompt,
+        api_url,
+        api_key,
+        cloud_environment=args.env,
+        branch=args.branch,
+    )
     runner = CloudRunner(args.env, args.branch, args.poll_interval)
     return runner.run(cloud_prompt, issue_ref=extract_issue_reference(original_prompt))
 

@@ -63,32 +63,143 @@ class CloudStatus:
         return self.state == "READY"
 
 
-def build_cloud_prompt(original_prompt: str, api_url: str, api_key: str) -> str:
-    """Add the Cloud compatibility instructions and Tines credentials."""
+SUPERVISOR_CONTRACT_HEADING = "## The contract"
+RUN_METADATA_PATTERN = re.compile(
+    r"This is run (?P<run_id>\S+) on runner \"(?P<runner>[^\"]+)\" "
+    r"for issue (?P<issue>[^;]+); it times out after (?P<timeout>\d+) minutes\."
+)
+
+
+def _cloud_run_header(original_prompt: str) -> str:
+    """Return a canonical run header without local-session claims."""
+
+    metadata = RUN_METADATA_PATTERN.search(original_prompt)
+    if metadata is None:
+        return "# Supervisor run"
+
+    values = metadata.groupdict()
+    return (
+        "# Supervisor run\n\n"
+        f"This is run {values['run_id']} on runner \"{values['runner']}\" "
+        f"for issue {values['issue']}; it times out after {values['timeout']} minutes. "
+        "The Tines supervisor dispatched you to work the issue described at the end of this prompt."
+    )
+
+
+def _cloud_preamble(
+    api_url: str,
+    api_key: str,
+    *,
+    cloud_environment: str | None = None,
+    branch: str | None = None,
+) -> str:
+    """Build the execution-specific Cloud sections.
+
+    The bridge currently has no provider-supported out-of-band credential
+    channel, so the key is embedded as a temporary compatibility measure. The
+    design document records the production replacement; keeping this detail in
+    one function makes that change auditable.
+    """
 
     quoted_url = shlex.quote(api_url)
     quoted_key = shlex.quote(api_key)
+    checkout = "Codex Cloud checked out the repository selected for this task"
+    if cloud_environment:
+        checkout += f" by environment `{cloud_environment}`"
+    if branch:
+        checkout += f" at the requested branch `{branch}`"
+    checkout += "."
+
+    return "\n".join(
+        [
+            "## Authentication",
+            "",
+            "This bridge currently delivers the Tines run credential in this task prompt. "
+            "It is ephemeral and may be visible in Cloud task history or provider logs.",
+            "Before using the Tines CLI, export the credentials for this run:",
+            "",
+            "```sh",
+            f"export TINES_API_URL={quoted_url}",
+            f"export TINES_API_KEY={quoted_key}",
+            "```",
+            "",
+            "The key is scoped to this Tines run. Do not persist it, print it, commit it, "
+            "or reuse it after the run. Do not run `tines login`; use these environment "
+            "variables or an equivalent in-memory request.",
+            "",
+            "## Workspace",
+            "",
+            checkout,
+            "Work from the current directory. The local Tines runner workspace is not mounted here:",
+            "",
+            "- `prompt.md`, `repos.json`, and `skills/<name>/…` are not Cloud inputs and must not be expected.",
+            "- The Cloud checkout and its configured Git provider credentials are authoritative for code work.",
+            "- `AGENTS.md` files in the checkout provide the repository's durable Codex instructions; follow "
+            "them for setup, tests, and code conventions.",
+            "- Tines repository context below is descriptive and validates what should be checked out; it is "
+            "not a second workspace to clone.",
+            "",
+            "If the checkout does not match the repository context or the task needs a second repository, "
+            "comment the mismatch on the Tines issue and hand off. Do not silently work in a different repo.",
+            "Tines skills are not seeded by this bridge. If a required skill is not represented by the "
+            "checkout's `AGENTS.md` or Cloud environment, inspect it through the Tines context API/CLI "
+            "before proceeding; do not assume the local `skills/` path exists.",
+        ]
+    )
+
+
+def adapt_supervisor_prompt(
+    original_prompt: str,
+    api_url: str,
+    api_key: str,
+    *,
+    cloud_environment: str | None = None,
+    branch: str | None = None,
+) -> str:
+    """Adapt a Tines supervisor prompt to a Codex Cloud execution boundary.
+
+    Tines' issue contract and the stitched issue/context block are provider
+    neutral. Only the preamble before ``## The contract`` describes the local
+    runner's filesystem and credentials, so a recognized prompt replaces that
+    prefix and preserves the remainder exactly. Older or hand-written prompts
+    without the heading retain the compatibility wrapper rather than risking
+    loss of user content.
+    """
+
+    contract_marker = f"\n{SUPERVISOR_CONTRACT_HEADING}\n"
+    contract_start = original_prompt.find(contract_marker)
+    if contract_start < 0:
+        return _legacy_cloud_prompt(
+            original_prompt,
+            api_url,
+            api_key,
+            cloud_environment=cloud_environment,
+            branch=branch,
+        )
+
+    contract = original_prompt[contract_start + 1 :]
+    return (
+        f"{_cloud_run_header(original_prompt)}\n\n"
+        f"{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch)}\n\n"
+        f"{contract}"
+    )
+
+
+def _legacy_cloud_prompt(
+    original_prompt: str,
+    api_url: str,
+    api_key: str,
+    *,
+    cloud_environment: str | None = None,
+    branch: str | None = None,
+) -> str:
+    """Retain the old additive behavior for non-supervisor prompts."""
+
     preamble = f"""## tines-codex-cloud compatibility override
 
 You are running as a Codex Cloud task launched by a Tines custom runner.
-The repository checkout for this task is owned and configured by the selected
-Codex Cloud environment. Work in that checkout; do not expect the local Tines
-workspace, `repos.json`, or `skills/...` paths mentioned in the original prompt
-to exist here.
-
-Before using the Tines CLI, export the ephemeral credentials for this run:
-
-```sh
-export TINES_API_URL={quoted_url}
-export TINES_API_KEY={quoted_key}
-```
-
-The key is scoped to this Tines run. Do not persist it, print it, commit it, or
-reuse it after the run. Follow the original Tines supervisor prompt below for
-the issue workflow, adapting any local-runner-only instructions to this Cloud
-environment. The local bridge records the Cloud task URL in the issue's
-bridge-owned `cloud-task` link artifact and writes the terminal result or
-failure reason as a comment. Those bookkeeping operations are best effort.
+{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch)}
+The local bridge records the Cloud task URL in the issue's bridge-owned `cloud-task` link artifact and writes the terminal result or failure reason as a comment. Those bookkeeping operations are best effort.
 You own the implementation, tests, progress and implementation-summary
 comments, work product artifacts (including the required PR artifact), and
 issue transition.
@@ -99,6 +210,25 @@ because the Cloud task reached a terminal state.
 
 """
     return f"{preamble}{original_prompt}\n"
+
+
+def build_cloud_prompt(
+    original_prompt: str,
+    api_url: str,
+    api_key: str,
+    *,
+    cloud_environment: str | None = None,
+    branch: str | None = None,
+) -> str:
+    """Build the Cloud-adapted prompt sent to `codex cloud exec`."""
+
+    return adapt_supervisor_prompt(
+        original_prompt,
+        api_url,
+        api_key,
+        cloud_environment=cloud_environment,
+        branch=branch,
+    )
 
 
 def required_tines_environment(environment: dict[str, str] | None = None) -> tuple[str, str]:

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from tines_codex_cloud.bridge import (
     CloudCommandError,
     CloudRunner,
+    adapt_supervisor_prompt,
     build_cloud_prompt,
     check_prerequisites,
     extract_status,
@@ -103,6 +104,75 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("exit code 2", checks[2].detail)
         self.assertFalse(checks[3].ok)
         self.assertEqual(checks[3].detail, "executable not found on PATH")
+
+    def test_adapt_supervisor_prompt_replaces_local_preamble_and_preserves_contract(self) -> None:
+        original = """# Supervisor run
+
+This is run arun_123 on runner "cloud-example" for issue Demo/7; it times out after 30 minutes. The Tines supervisor dispatched you to work the issue described at the end of this prompt.
+
+## Authentication
+
+The runner daemon supplied the Tines key in the environment.
+
+## Workspace
+
+Your working directory is a fresh per-run workspace containing:
+
+- `prompt.md`
+- `skills/<name>/…`
+- `repos.json`
+
+## The contract
+
+- Comment progress on the issue.
+- Transition the issue before finishing.
+
+## Issue: Demo/7
+
+Fix the reported behavior.
+"""
+        adapted = adapt_supervisor_prompt(
+            original,
+            "https://tines.example/api",
+            "ephemeral'key",
+            cloud_environment="demo-environment",
+            branch="codex/demo-7",
+        )
+        contract_start = adapted.index("## The contract")
+        original_contract_start = original.index("## The contract")
+
+        self.assertEqual(
+            adapted[contract_start:],
+            original[original_contract_start:],
+        )
+        self.assertIn("Codex Cloud checked out the repository selected for this task", adapted)
+        self.assertIn("`demo-environment`", adapted)
+        self.assertIn("`codex/demo-7`", adapted)
+        self.assertIn("export TINES_API_KEY='ephemeral'\"'\"'key'", adapted)
+        self.assertNotIn("The runner daemon supplied the Tines key in the environment.", adapted)
+        self.assertNotIn("fresh per-run workspace", adapted)
+        self.assertIn("`AGENTS.md`", adapted)
+
+    def test_adapt_resumed_prompt_does_not_make_a_new_cloud_task_claim_continuity(self) -> None:
+        original = """# Supervisor run (resumed)
+
+You are resuming your own previous session. This is run arun_new on runner "cloud-example" for issue Demo/7; it times out after 30 minutes. It continues run arun_prev, whose
+workspace you are still in and whose conversation you are still holding.
+
+## The contract
+
+- Continue the work.
+
+## Issue: Demo/7
+
+Fix the reported behavior.
+"""
+        adapted = adapt_supervisor_prompt(original, "https://tines.example", "run-key")
+
+        self.assertTrue(adapted.startswith("# Supervisor run\n\nThis is run arun_new"))
+        self.assertNotIn("resuming your own previous session", adapted)
+        self.assertNotIn("workspace you are still in", adapted)
+        self.assertIn("## The contract\n\n- Continue the work.", adapted)
 
     def test_build_cloud_prompt_contains_override_credentials_and_original_prompt(self) -> None:
         prompt = build_cloud_prompt("Tines work\n", "https://tines.example/api", "key'with-quote")
