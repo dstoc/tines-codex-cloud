@@ -1,0 +1,107 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Maintain release pull request and GitHub release
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main
+
+  build-release:
+    name: Build and upload release artifacts
+    needs: release
+    if: needs.release.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact released tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build
+
+      - name: Run tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Validate distribution files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tomllib
+          import zipfile
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())[
+              "project"
+          ]["version"]
+          expected = {
+              f"tines_codex_cloud-{version}-py3-none-any.whl",
+              f"tines_codex_cloud-{version}.tar.gz",
+          }
+          actual = {path.name for path in Path("dist").iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(f"unexpected dist contents: {sorted(actual)!r}")
+
+          wheel = Path("dist") / f"tines_codex_cloud-{version}-py3-none-any.whl"
+          with zipfile.ZipFile(wheel) as archive:
+              metadata = next(
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              )
+              metadata_text = archive.read(metadata).decode("utf-8")
+          if "Requires-Dist:" in metadata_text:
+              raise SystemExit("runtime dependencies unexpectedly found in wheel metadata")
+          print(f"validated {wheel.name} and tines_codex_cloud-{version}.tar.gz")
+          PY
+
+      - name: Smoke-test wheel in a clean environment
+        run: |
+          smoke_env="$RUNNER_TEMP/tines-codex-cloud-smoke"
+          python -m venv "$smoke_env"
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          "$smoke_env/bin/python" -m pip install --no-index --no-deps "$wheel"
+          expected_version="$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])')"
+          test "$($smoke_env/bin/tines-codex-cloud --version)" = "$expected_version"
+          "$smoke_env/bin/tines-codex-cloud" --help
+
+      - name: Upload artifacts to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload \
+            "${{ needs.release.outputs.tag_name }}" \
+            dist/tines_codex_cloud-*.whl \
+            dist/tines_codex_cloud-*.tar.gz \
+            --clobber
