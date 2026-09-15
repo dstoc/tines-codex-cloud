@@ -12,6 +12,7 @@ from .bridge import (
     CloudRunner,
     build_cloud_prompt,
     check_prerequisites,
+    extract_issue_reference,
     read_prompt,
     required_tines_environment,
 )
@@ -60,7 +61,7 @@ def run_command(args: argparse.Namespace) -> int:
     original_prompt = read_prompt(args.prompt_file)
     cloud_prompt = build_cloud_prompt(original_prompt, api_url, api_key)
     runner = CloudRunner(args.env, args.branch, args.poll_interval)
-    return runner.run(cloud_prompt)
+    return runner.run(cloud_prompt, issue_ref=extract_issue_reference(original_prompt))
 
 
 def doctor_command(args: argparse.Namespace) -> int:

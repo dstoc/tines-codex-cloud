@@ -36,8 +36,9 @@ environment from the Tines prompt.
 - Python 3.11 or newer.
 - The `codex` CLI installed and authenticated on the Tines runner host, with
   access to `codex cloud exec` and `codex cloud status`.
-- The Tines `tines` CLI available to the Codex Cloud agent when the agent needs
-  to comment, attach artifacts, or transition the originating issue.
+- The Tines `tines` CLI available on the runner host for bridge bookkeeping and
+  in the Codex Cloud environment when the agent needs to comment, attach
+  artifacts, or transition the originating issue.
 - A Codex Cloud environment already configured with the intended repository.
 
 ## Setup
@@ -138,8 +139,20 @@ available in Cloud.
 4. It extracts the returned task URL and polls `codex cloud status` in the
    foreground. `PENDING` and other recognized in-progress states continue
    polling; `READY` succeeds and `ERROR` fails.
-5. The Cloud agent remains responsible for ordinary Tines comments, artifacts,
-   and issue transitions using the exported credentials.
+5. When the generated prompt contains an issue header and the submission
+   returned a URL, the bridge best-effort attaches that URL as the
+   bridge-owned `cloud-task` link artifact. It does not attach a task ID as a
+   link because Tines link artifacts require an `http(s)` URL.
+6. At a terminal state, the bridge best-effort adds one result comment. JSON or
+   labelled status details are reduced to a bounded summary; an `ERROR` state
+   without detail is reported explicitly as having no provider reason. A PR
+   URL reported by Cloud is included in that comment when available.
+7. The Cloud agent remains responsible for ordinary Tines progress and
+   implementation-summary comments, work product artifacts (including the
+   required `pr` artifact), and issue transitions using the exported
+   credentials. The bridge never fabricates a diff or PR artifact and never
+   transitions the issue. The task link is the durable pointer to the provider
+   task; the agent's PR artifact is the reviewable code result.
 
 ## Security notes
 
@@ -166,8 +179,10 @@ environment secret is not sufficient.
 - Tines skills are not forwarded into Cloud.
 - Environment, repository, and branch mapping is configured outside the
   wrapper.
-- The wrapper does not yet attach the Cloud task URL or a Cloud result summary
-  to the Tines issue.
+- Result bookkeeping is best effort: a Tines API/CLI outage does not change the
+  Cloud task exit code, and a provider's full transcript or diff is not copied
+  into Tines. Use the task URL for provider details and the agent-created PR
+  artifact for the reviewable diff.
 - Integration tests use mocked command execution; no real Codex Cloud task is
   created by the test suite.
 - Release packaging and runner-host upgrade/rollback procedures are documented

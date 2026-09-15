@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -31,7 +32,35 @@ NON_TERMINAL_STATES = {
     "WORKING",
 }
 TERMINAL_STATES = {"ERROR", "READY"}
-KNOWN_STATES = NON_TERMINAL_STATES | TERMINAL_STATES
+STATUS_ALIASES = {
+    "CANCELLED": "ERROR",
+    "CANCELED": "ERROR",
+    "COMPLETED": "READY",
+    "FAILED": "ERROR",
+    "FAILURE": "ERROR",
+    "SUCCESS": "READY",
+    "SUCCEEDED": "READY",
+}
+KNOWN_STATES = NON_TERMINAL_STATES | TERMINAL_STATES | set(STATUS_ALIASES)
+
+
+@dataclass(frozen=True)
+class CloudStatus:
+    """The stable subset of a ``codex cloud status`` response."""
+
+    state: str
+    detail: str | None = None
+    summary: str | None = None
+    error: str | None = None
+    pull_request_url: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL_STATES
+
+    @property
+    def succeeded(self) -> bool:
+        return self.state == "READY"
 
 
 def build_cloud_prompt(original_prompt: str, api_url: str, api_key: str) -> str:
@@ -57,7 +86,14 @@ export TINES_API_KEY={quoted_key}
 The key is scoped to this Tines run. Do not persist it, print it, commit it, or
 reuse it after the run. Follow the original Tines supervisor prompt below for
 the issue workflow, adapting any local-runner-only instructions to this Cloud
-environment.
+environment. The local bridge records the Cloud task URL in the issue's
+bridge-owned `cloud-task` link artifact and writes the terminal result or
+failure reason as a comment. Those bookkeeping operations are best effort.
+You own the implementation, tests, progress and implementation-summary
+comments, work product artifacts (including the required PR artifact), and
+issue transition.
+Do not fabricate a diff or PR artifact, and do not transition the issue merely
+because the Cloud task reached a terminal state.
 
 --- Original Tines supervisor prompt ---
 
@@ -76,6 +112,18 @@ def required_tines_environment(environment: dict[str, str] | None = None) -> tup
     return api_url, api_key
 
 
+def extract_issue_reference(prompt: str) -> str | None:
+    """Extract the generated ``project/number`` reference from a Tines prompt."""
+
+    match = re.search(
+        r"(?m)^## Issue:\s*(?P<project>[^/\n]+?)/(?P<number>[1-9][0-9]*)(?:\s+[—-]|\s*$)",
+        prompt,
+    )
+    if match is None:
+        return None
+    return f"{match.group('project').strip()}/{match.group('number')}"
+
+
 def extract_task_reference(output: str) -> str | None:
     """Extract a Cloud task URL or explicitly labelled task identifier."""
 
@@ -91,26 +139,122 @@ def extract_task_reference(output: str) -> str | None:
     return labelled_id[-1] if labelled_id else None
 
 
-def extract_status(output: str) -> str | None:
-    """Extract a known status from the simple text output of `codex cloud status`."""
+def extract_pull_request_url(output: str) -> str | None:
+    """Extract a GitHub pull-request URL when a provider reports one."""
+
+    urls = re.findall(
+        r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*",
+        output,
+        flags=re.IGNORECASE,
+    )
+    return urls[-1].rstrip(".,;:)]}>") if urls else None
+
+
+def _normalize_state(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    state = value.strip().upper().replace(" ", "_")
+    if state in STATUS_ALIASES:
+        return STATUS_ALIASES[state]
+    return state if state in NON_TERMINAL_STATES or state in TERMINAL_STATES else None
+
+
+def _string_field(value: dict[object, object], names: Sequence[str]) -> str | None:
+    for name in names:
+        field = value.get(name)
+        if isinstance(field, str) and field.strip():
+            return field.strip()
+    return None
+
+
+def _structured_status(value: object) -> CloudStatus | None:
+    """Find a status and result details in a JSON-shaped provider response."""
+
+    if isinstance(value, dict):
+        for key in ("status", "state", "phase"):
+            state = _normalize_state(value.get(key))
+            if state is None:
+                continue
+            summary = _string_field(value, ("summary", "result_summary"))
+            error = _string_field(value, ("error", "failure_reason", "reason"))
+            detail = error or _string_field(value, ("detail", "message"))
+            return CloudStatus(
+                state=state,
+                detail=detail,
+                summary=summary,
+                error=error,
+                pull_request_url=extract_pull_request_url(json.dumps(value)),
+            )
+        for key in ("task", "data", "result", "output"):
+            nested = _structured_status(value.get(key))
+            if nested is not None:
+                return nested
+    elif isinstance(value, list):
+        for item in reversed(value):
+            nested = _structured_status(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def parse_cloud_status(output: str) -> CloudStatus | None:
+    """Parse JSON or human-readable output from ``codex cloud status``."""
+
+    candidates = [output.strip(), *reversed(output.splitlines())]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            structured = _structured_status(json.loads(candidate))
+        except json.JSONDecodeError:
+            continue
+        if structured is not None:
+            return structured
 
     labelled = re.findall(
-        r"[\"']?(?:status|state)[\"']?\s*[:=]\s*[\"']?([A-Za-z][A-Za-z0-9_-]*)",
+        r"[\"']?(?:status|state|phase)[\"']?\s*[:=]\s*[\"']?([A-Za-z][A-Za-z0-9 _-]*)",
         output,
         flags=re.IGNORECASE,
     )
     candidates = labelled or re.findall(
-        r"\b(?:CREATED|ERROR|EXECUTING|IN_PROGRESS|PENDING|QUEUED|READY|RUNNING|STARTING|SUBMITTED|WORKING)\b",
+        r"\b(?:CANCELLED|CANCELED|COMPLETED|CREATED|ERROR|EXECUTING|FAILED|FAILURE|IN_PROGRESS|PENDING|QUEUED|READY|RUNNING|STARTING|SUBMITTED|SUCCESS|SUCCEEDED|WORKING)\b",
         output,
         flags=re.IGNORECASE,
     )
-    if not candidates:
+    state = next((_normalize_state(candidate) for candidate in reversed(candidates)), None)
+    if state is None:
         return None
-    status = candidates[-1].upper()
-    return status if status in KNOWN_STATES else None
+
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        match = re.match(
+            r"\s*(summary|error|reason|message|detail)\s*[:=]\s*(.*?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match and match.group(2):
+            fields[match.group(1).lower()] = match.group(2).strip()
+    summary = fields.get("summary")
+    error = fields.get("error") or fields.get("reason")
+    detail = error or fields.get("detail") or fields.get("message")
+    return CloudStatus(
+        state=state,
+        detail=detail,
+        summary=summary,
+        error=error,
+        pull_request_url=extract_pull_request_url(output),
+    )
+
+
+def extract_status(output: str) -> str | None:
+    """Return the normalized state for compatibility with the original API."""
+
+    status = parse_cloud_status(output)
+    return status.state if status is not None else None
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+TinesCommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 @dataclass(frozen=True)
@@ -186,6 +330,8 @@ class CloudRunner:
         *,
         codex_binary: str = "codex",
         run_command: CommandRunner = subprocess.run,
+        tines_binary: str = "tines",
+        run_tines_command: TinesCommandRunner = subprocess.run,
         sleep: Callable[[float], None] = time.sleep,
         output: TextIO = sys.stdout,
     ) -> None:
@@ -198,8 +344,11 @@ class CloudRunner:
         self.poll_interval = poll_interval
         self.codex_binary = codex_binary
         self.run_command = run_command
+        self.tines_binary = tines_binary
+        self.run_tines_command = run_tines_command
         self.sleep = sleep
         self.output = output
+        self.last_status: CloudStatus | None = None
 
     def _safe_environment(self) -> dict[str, str]:
         child_environment = os.environ.copy()
@@ -228,6 +377,103 @@ class CloudRunner:
         except OSError as exc:
             raise CloudCommandError(f"unable to execute {self.codex_binary!r}: {exc.strerror or exc}") from exc
 
+    def _execute_tines(
+        self,
+        arguments: Sequence[str],
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Run a Tines bookkeeping command without exposing its output."""
+
+        # Never fall back to a persistent login/configured user key for
+        # bookkeeping. The runner daemon is expected to provide both values
+        # for this run, and the CLI entry point validates them before launch.
+        if not os.environ.get("TINES_API_URL", "").strip() or not os.environ.get("TINES_API_KEY", ""):
+            return None
+        try:
+            return self.run_tines_command(
+                [self.tines_binary, *arguments],
+                text=True,
+                capture_output=True,
+                env=os.environ.copy(),
+                check=False,
+            )
+        except (FileNotFoundError, OSError):
+            return None
+
+    def _warn_integration_failure(self, action: str) -> None:
+        print(
+            f"warning: unable to {action}; Cloud task execution will still determine the exit code.",
+            file=self.output,
+            flush=True,
+        )
+
+    def _record_task_link(self, issue_ref: str | None, task_reference: str) -> None:
+        """Attach the provider URL as a stable, bridge-owned Tines artifact."""
+
+        if issue_ref is None or not re.match(r"https?://", task_reference, flags=re.IGNORECASE):
+            return
+        result = self._execute_tines(
+            [
+                "issues",
+                "artifacts",
+                "attach",
+                issue_ref,
+                "cloud-task",
+                "--link",
+                task_reference,
+                "--title",
+                "Codex Cloud task",
+            ]
+        )
+        if result is None or result.returncode != 0:
+            self._warn_integration_failure("record the Cloud task link on the Tines issue")
+
+    def _comment_detail(self, value: str | None) -> str | None:
+        """Keep provider output useful in a comment without allowing huge logs."""
+
+        if value is None:
+            return None
+        detail = " ".join(value.replace("\x00", "").split())
+        api_key = os.environ.get("TINES_API_KEY", "")
+        if api_key:
+            detail = detail.replace(api_key, "[redacted]")
+        if not detail:
+            return None
+        return detail if len(detail) <= 2000 else f"{detail[:1997]}..."
+
+    def _record_result_comment(
+        self,
+        issue_ref: str | None,
+        task_reference: str,
+        *,
+        status: CloudStatus | None,
+        failure: str | None = None,
+    ) -> None:
+        """Leave a concise terminal result or failure reason on the issue."""
+
+        if issue_ref is None:
+            return
+        succeeded = status is not None and status.succeeded and failure is None
+        if succeeded:
+            lines = ["Codex Cloud task completed successfully.", f"Task: {task_reference}"]
+            summary = self._comment_detail(status.summary or status.detail)
+            if summary:
+                lines.append(f"Summary: {summary}")
+            if status.pull_request_url:
+                lines.append(f"PR reported by Cloud: {status.pull_request_url}")
+        else:
+            reason = self._comment_detail(
+                failure or (status.error if status is not None else None) or (status.detail if status else None)
+            )
+            lines = ["Codex Cloud task did not complete successfully.", f"Task: {task_reference}"]
+            lines.append(f"Reason: {reason or 'Codex Cloud reported a failure without a reason.'}")
+        lines.append(
+            "The bridge records the Cloud task result; the Cloud agent owns the implementation "
+            "summary, work-product/PR artifacts, and issue transition."
+        )
+        result = self._execute_tines(["issues", "comment", issue_ref, "\n".join(lines)])
+        if result is None or result.returncode != 0:
+            self._warn_integration_failure("record the Cloud task result on the Tines issue")
+
     def submit(self, prompt: str) -> str:
         arguments = ["cloud", "exec", "--env", self.environment]
         if self.branch is not None:
@@ -244,29 +490,39 @@ class CloudRunner:
     def poll(self, task_reference: str) -> bool:
         """Poll until READY or ERROR; return whether the task succeeded."""
 
+        self.last_status = None
         while True:
             result = self._execute(["cloud", "status", task_reference])
             if result.returncode != 0:
                 raise CloudCommandError(
                     f"codex cloud status failed with exit code {result.returncode}"
                 )
-            status = extract_status(result.stdout)
-            if status is None:
+            parsed = parse_cloud_status(result.stdout)
+            if parsed is None:
                 raise CloudCommandError("codex cloud status returned no recognized task status")
 
-            print(f"Cloud task status: {status}", file=self.output, flush=True)
-            if status == "READY":
+            self.last_status = parsed
+            print(f"Cloud task status: {parsed.state}", file=self.output, flush=True)
+            if parsed.state == "READY":
                 return True
-            if status == "ERROR":
+            if parsed.state == "ERROR":
                 return False
             self.sleep(self.poll_interval)
 
-    def run(self, prompt: str) -> int:
+    def run(self, prompt: str, *, issue_ref: str | None = None) -> int:
         """Submit and synchronously wait for the Cloud task."""
 
+        issue_ref = issue_ref or extract_issue_reference(prompt)
         task_reference = self.submit(prompt)
+        self._record_task_link(issue_ref, task_reference)
         print("Cloud task submitted; polling until completion.", file=self.output, flush=True)
-        return 0 if self.poll(task_reference) else 1
+        try:
+            succeeded = self.poll(task_reference)
+        except CloudCommandError as exc:
+            self._record_result_comment(issue_ref, task_reference, status=None, failure=str(exc))
+            raise
+        self._record_result_comment(issue_ref, task_reference, status=self.last_status)
+        return 0 if succeeded else 1
 
 
 def read_prompt(path: str | Path) -> str:

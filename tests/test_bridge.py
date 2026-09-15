@@ -12,7 +12,10 @@ from tines_codex_cloud.bridge import (
     build_cloud_prompt,
     check_prerequisites,
     extract_status,
+    extract_issue_reference,
+    extract_pull_request_url,
     extract_task_reference,
+    parse_cloud_status,
     required_tines_environment,
 )
 
@@ -28,6 +31,29 @@ class FakeCodex:
         if args[1:3] == ["cloud", "exec"]:
             return subprocess.CompletedProcess(args, 0, self.submission, "")
         return subprocess.CompletedProcess(args, 0, f"status: {next(self.statuses)}\n", "")
+
+
+class ResultCodex:
+    def __init__(self, status_output: str, submission: str = "Task URL: https://cloud.example/tasks/123\n") -> None:
+        self.status_output = status_output
+        self.submission = submission
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append((args, kwargs))
+        if args[1:3] == ["cloud", "exec"]:
+            return subprocess.CompletedProcess(args, 0, self.submission, "")
+        return subprocess.CompletedProcess(args, 0, self.status_output, "")
+
+
+class FakeTines:
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, self.returncode, "", "private diagnostic")
 
 
 class BridgeTests(unittest.TestCase):
@@ -85,6 +111,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("export TINES_API_URL=https://tines.example/api", prompt)
         self.assertIn("export TINES_API_KEY='key'\"'\"'with-quote'", prompt)
         self.assertIn("Tines work", prompt)
+        self.assertIn("bridge-owned `cloud-task` link artifact", prompt)
+        self.assertIn("Do not fabricate a diff or PR artifact", prompt)
 
     def test_required_environment_does_not_accept_missing_values(self) -> None:
         with self.assertRaisesRegex(CloudCommandError, "must be set"):
@@ -97,6 +125,32 @@ class BridgeTests(unittest.TestCase):
         )
         self.assertEqual(extract_task_reference("Task ID: task_123\n"), "task_123")
         self.assertIsNone(extract_task_reference("submission failed"))
+
+    def test_extract_issue_reference_uses_the_generated_issue_header(self) -> None:
+        self.assertEqual(
+            extract_issue_reference("preamble\n## Issue: demo/7 — A task\nnext"),
+            "demo/7",
+        )
+        self.assertIsNone(extract_issue_reference("no issue block"))
+
+    def test_parse_cloud_status_preserves_summary_error_and_pr_url(self) -> None:
+        status = parse_cloud_status(
+            '{"status":"READY","summary":"Tests passed","pr_url":"https://github.com/acme/app/pull/42"}'
+        )
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.state, "READY")
+        self.assertEqual(status.summary, "Tests passed")
+        self.assertEqual(status.pull_request_url, "https://github.com/acme/app/pull/42")
+        self.assertEqual(
+            parse_cloud_status("status: ERROR\nreason: tests failed\n").error,
+            "tests failed",
+        )
+        self.assertEqual(
+            extract_pull_request_url("PR: https://github.com/acme/app/pull/42."),
+            "https://github.com/acme/app/pull/42",
+        )
 
     def test_extract_status_handles_labelled_and_standalone_output(self) -> None:
         self.assertEqual(extract_status('{"status": "PENDING"}'), "PENDING")
@@ -160,6 +214,90 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(runner.run("prompt contains an ephemeral secret"), 0)
         self.assertNotIn("ephemeral secret", output.getvalue())
         self.assertIn("Cloud task status: READY", output.getvalue())
+
+    def test_run_records_task_link_and_terminal_summary_on_the_issue(self) -> None:
+        codex = ResultCodex(
+            '{"status":"READY","summary":"Tests passed","pr_url":"https://github.com/acme/app/pull/42"}'
+        )
+        tines = FakeTines()
+        with patch.dict(
+            os.environ,
+            {"TINES_API_KEY": "secret", "TINES_API_URL": "https://tines.example"},
+        ):
+            runner = CloudRunner(
+                "example",
+                run_command=codex,
+                run_tines_command=tines,
+                sleep=lambda _: None,
+                output=io.StringIO(),
+            )
+            self.assertEqual(runner.run("## Issue: demo/7 — ship it\n"), 0)
+
+        self.assertEqual(tines.calls[0][0], [
+            "tines",
+            "issues",
+            "artifacts",
+            "attach",
+            "demo/7",
+            "cloud-task",
+            "--link",
+            "https://cloud.example/tasks/123",
+            "--title",
+            "Codex Cloud task",
+        ])
+        comment = tines.calls[1][0][4]
+        self.assertIn("completed successfully", comment)
+        self.assertIn("Summary: Tests passed", comment)
+        self.assertIn("https://github.com/acme/app/pull/42", comment)
+        self.assertNotIn("secret", comment)
+        self.assertEqual(tines.calls[0][1]["env"]["TINES_API_KEY"], "secret")
+        self.assertNotIn("TINES_API_KEY", codex.calls[0][1]["env"])
+
+    def test_run_records_an_explicit_failure_reason_without_changing_cloud_result(self) -> None:
+        codex = ResultCodex('{"status":"ERROR","error":"tests failed"}')
+        tines = FakeTines()
+        with patch.dict(os.environ, {"TINES_API_KEY": "secret", "TINES_API_URL": "https://tines.example"}):
+            runner = CloudRunner(
+                "example",
+                run_command=codex,
+                run_tines_command=tines,
+                output=io.StringIO(),
+            )
+            self.assertEqual(runner.run("## Issue: demo/7 — ship it\n"), 1)
+
+        self.assertEqual(len(tines.calls), 2)
+        self.assertIn("Reason: tests failed", tines.calls[1][0][4])
+
+    def test_result_comment_redacts_the_ephemeral_tines_key(self) -> None:
+        codex = ResultCodex('{"status":"READY","summary":"secret was not used"}')
+        tines = FakeTines()
+        with patch.dict(os.environ, {"TINES_API_KEY": "secret", "TINES_API_URL": "https://tines.example"}):
+            runner = CloudRunner(
+                "example",
+                run_command=codex,
+                run_tines_command=tines,
+                output=io.StringIO(),
+            )
+            self.assertEqual(runner.run("## Issue: demo/7 — ship it\n"), 0)
+
+        self.assertIn("[redacted] was not used", tines.calls[1][0][4])
+        self.assertNotIn("secret was not used", tines.calls[1][0][4])
+
+    def test_result_bookkeeping_is_best_effort(self) -> None:
+        codex = ResultCodex('{"status":"READY","summary":"done"}')
+        tines = FakeTines(returncode=9)
+        output = io.StringIO()
+        with patch.dict(os.environ, {"TINES_API_KEY": "secret", "TINES_API_URL": "https://tines.example"}):
+            runner = CloudRunner(
+                "example",
+                run_command=codex,
+                run_tines_command=tines,
+                output=output,
+            )
+            self.assertEqual(runner.run("## Issue: demo/7 — ship it\n"), 0)
+
+        self.assertEqual(len(tines.calls), 2)
+        self.assertEqual(output.getvalue().count("warning:"), 2)
 
     def test_poll_rejects_malformed_status(self) -> None:
         fake = FakeCodex([])
