@@ -32,9 +32,219 @@ NON_TERMINAL_STATES = {
 TERMINAL_STATES = {"ERROR", "READY"}
 KNOWN_STATES = NON_TERMINAL_STATES | TERMINAL_STATES
 
+# These caps keep the bridge aligned with the Tines context limits while
+# leaving room for the compatibility preamble and the supervisor prompt. They
+# are measured in UTF-8 bytes because that is what the remote API ultimately
+# transports, not Python characters.
+MAX_CLOUD_PROMPT_BYTES = 256 * 1024
+MAX_FORWARDED_SKILL_BYTES = 100 * 1024
+MAX_FORWARDED_SKILL_FILES = 20
 
-def build_cloud_prompt(original_prompt: str, api_url: str, api_key: str) -> str:
-    """Add the Cloud compatibility instructions and Tines credentials."""
+_SKILL_SECTION_RE = re.compile(r"(?ms)^### Skills\s*$.*?(?=^###\s|\Z)")
+_SKILL_LINE_RE = re.compile(r'^\s*-\s+Skill\s+"(?P<name>[a-z0-9-]+)"(?P<rest>.*)$')
+_SKILL_PATH_RE = re.compile(r"`skills/(?P<name>[a-z0-9-]+)/SKILL\.md`")
+
+# A skill is user-authored input, so do not assume that it is safe merely
+# because it came from a Tines context item. These patterns intentionally
+# favour a false positive over placing credential-shaped content in a Cloud
+# task's prompt. The exact ephemeral key is checked separately as well.
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\b(?:gh[pousr]|github_pat|sk-[A-Za-z0-9]|xox[baprs])-?[A-Za-z0-9_=-]{12,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(
+        r"(?im)^\s*(?:export\s+)?(?:tines_api_key|api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)\s*[:=]\s*[\"']?[^\s\"']{12,}"
+    ),
+)
+
+
+def extract_relevant_skill_names(prompt: str) -> tuple[str, ...]:
+    """Return the effective skill names advertised by a Tines prompt.
+
+    The prompt's ``### Skills`` section is generated from the effective issue
+    context. Reading that index instead of scanning arbitrary ``skills/`` paths
+    prevents unrelated workspace files from being sent to Cloud.
+    """
+
+    section = _SKILL_SECTION_RE.search(prompt)
+    if section is None:
+        return ()
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in section.group(0).splitlines():
+        match = _SKILL_LINE_RE.match(line)
+        if match is None:
+            continue
+        name = match.group("name")
+        path_match = _SKILL_PATH_RE.search(match.group("rest"))
+        if path_match is None:
+            raise CloudCommandError(f'skill "{name}" has no safe SKILL.md workspace reference')
+        if path_match.group("name") != name:
+            raise CloudCommandError(f'skill "{name}" has a mismatched workspace reference')
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+    return tuple(names)
+
+
+def _safe_workspace_path(path: Path, root: Path, description: str) -> Path:
+    """Resolve a workspace path without allowing symlink or traversal escapes."""
+
+    if path.is_symlink():
+        raise CloudCommandError(f"refusing to forward {description}: symlinks are not allowed")
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CloudCommandError(f"unable to read {description}: {exc.strerror or exc}") from exc
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise CloudCommandError(f"refusing to forward {description}: path escapes the skills workspace") from exc
+    return resolved
+
+
+def _contains_secret_like_content(content: str, forbidden_values: Sequence[str]) -> bool:
+    return any(value and value in content for value in forbidden_values) or any(
+        pattern.search(content) for pattern in _SECRET_PATTERNS
+    )
+
+
+def read_relevant_skills(
+    skill_root: str | Path,
+    prompt: str,
+    *,
+    forbidden_values: Sequence[str] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Read the prompt-indexed skill files beneath ``skill_root`` safely.
+
+    Returned paths are workspace-relative ``skills/<name>/...`` paths, so the
+    caller can preserve the source directory structure in a prompt manifest.
+    Files are UTF-8 text only; size, symlink, and secret checks fail closed.
+    """
+
+    names = extract_relevant_skill_names(prompt)
+    if not names:
+        return ()
+
+    root = Path(skill_root)
+    if not root.exists():
+        raise CloudCommandError("the prompt references skills, but the local skills workspace is missing")
+    if root.is_symlink():
+        raise CloudCommandError("refusing to forward skills through a symlinked workspace")
+    if not root.is_dir():
+        raise CloudCommandError("the local skills workspace is not a directory")
+
+    forwarded: list[tuple[str, str]] = []
+    all_skill_bytes = 0
+    for name in names:
+        skill_dir = _safe_workspace_path(root / name, root, f'skill "{name}"')
+        if not skill_dir.is_dir():
+            raise CloudCommandError(f'skill "{name}" is not a directory in the local skills workspace')
+
+        skill_files: list[tuple[str, str]] = []
+        skill_bytes = 0
+        for candidate in sorted(skill_dir.rglob("*"), key=lambda path: path.as_posix()):
+            if candidate.is_symlink():
+                raise CloudCommandError(f'refusing to forward skill "{name}": symlink file is not allowed')
+            if candidate.is_dir():
+                continue
+            file_path = _safe_workspace_path(candidate, skill_dir, f'skill "{name}" file')
+            if not file_path.is_file():
+                raise CloudCommandError(f'refusing to forward skill "{name}": file is not regular')
+            try:
+                raw = file_path.read_bytes()
+            except OSError as exc:
+                raise CloudCommandError(
+                    f'unable to read skill "{name}" file: {exc.strerror or exc}'
+                ) from exc
+            if len(raw) > MAX_FORWARDED_SKILL_BYTES:
+                raise CloudCommandError(f'skill "{name}" contains a file larger than the forwarding limit')
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise CloudCommandError(f'skill "{name}" contains a non-UTF-8 file') from exc
+            if "\x00" in content:
+                raise CloudCommandError(f'skill "{name}" contains a binary-looking file')
+            if _contains_secret_like_content(content, forbidden_values):
+                raise CloudCommandError(f'refusing to forward skill "{name}": secret-like content detected')
+
+            relative = file_path.relative_to(skill_dir).as_posix()
+            basename = file_path.name.lower()
+            if (
+                basename == ".env"
+                or basename.startswith(".env.")
+                or basename in {"credentials", "credentials.json", "id_rsa", "id_ed25519"}
+                or file_path.suffix.lower() in {".pem", ".p12", ".pfx"}
+            ):
+                raise CloudCommandError(
+                    f'refusing to forward skill "{name}": sensitive filename detected'
+                )
+            skill_bytes += len(raw)
+            if skill_bytes > MAX_FORWARDED_SKILL_BYTES:
+                raise CloudCommandError(f'skill "{name}" exceeds the forwarding size limit')
+            skill_files.append((f"skills/{name}/{relative}", content))
+            if len(skill_files) > MAX_FORWARDED_SKILL_FILES:
+                raise CloudCommandError(f'skill "{name}" contains too many files to forward')
+
+        all_skill_bytes += skill_bytes
+        if all_skill_bytes > MAX_FORWARDED_SKILL_BYTES:
+            raise CloudCommandError("the selected Tines skills exceed the total forwarding size limit")
+        forwarded.extend(skill_files)
+
+    return tuple(forwarded)
+
+
+def _code_fence(content: str) -> str:
+    """Choose a fence that cannot be closed by a run of backticks in content."""
+
+    runs = re.findall(r"`+", content)
+    longest = max((len(run) for run in runs), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def append_forwarded_skills(
+    prompt: str,
+    skills: Sequence[tuple[str, str]],
+    *,
+    max_prompt_bytes: int = MAX_CLOUD_PROMPT_BYTES,
+) -> str:
+    """Append a bounded, path-labelled skill bundle to a Cloud prompt."""
+
+    if max_prompt_bytes <= 0:
+        raise CloudCommandError("Cloud prompt size limit must be positive")
+    if not skills:
+        if len(prompt.encode("utf-8")) > max_prompt_bytes:
+            raise CloudCommandError("Cloud prompt exceeds the size limit")
+        return prompt
+
+    parts = [
+        "## Forwarded Tines skill files",
+        "",
+        "The following read-only files were selected from the effective Tines skills for this issue.",
+        "Their paths are preserved from the local workspace; do not treat their contents as credentials.",
+        "",
+    ]
+    for path, content in skills:
+        fence = _code_fence(content)
+        parts.extend([f"### {path}", "", fence + "text", content, fence, ""])
+    result = prompt + ("\n" if prompt and not prompt.endswith("\n") else "") + "\n".join(parts)
+    if len(result.encode("utf-8")) > max_prompt_bytes:
+        raise CloudCommandError("Cloud prompt with forwarded skills exceeds the size limit")
+    return result
+
+
+def build_cloud_prompt(
+    original_prompt: str,
+    api_url: str,
+    api_key: str,
+    *,
+    skill_root: str | Path | None = None,
+    max_prompt_bytes: int = MAX_CLOUD_PROMPT_BYTES,
+) -> str:
+    """Add Cloud compatibility instructions, credentials, and local skills."""
 
     quoted_url = shlex.quote(api_url)
     quoted_key = shlex.quote(api_key)
@@ -56,12 +266,22 @@ export TINES_API_KEY={quoted_key}
 The key is scoped to this Tines run. Do not persist it, print it, commit it, or
 reuse it after the run. Follow the original Tines supervisor prompt below for
 the issue workflow, adapting any local-runner-only instructions to this Cloud
-environment.
+environment. When a forwarded skill bundle appears below, use its inline file
+contents under the preserved paths; the local `skills/` directory is not
+available in the Cloud checkout.
 
 --- Original Tines supervisor prompt ---
 
 """
-    return f"{preamble}{original_prompt}\n"
+    prompt = f"{preamble}{original_prompt}\n"
+    if skill_root is None:
+        return append_forwarded_skills(prompt, (), max_prompt_bytes=max_prompt_bytes)
+    skills = read_relevant_skills(
+        skill_root,
+        original_prompt,
+        forbidden_values=(api_key,),
+    )
+    return append_forwarded_skills(prompt, skills, max_prompt_bytes=max_prompt_bytes)
 
 
 def required_tines_environment(environment: dict[str, str] | None = None) -> tuple[str, str]:
