@@ -143,14 +143,18 @@ available in Cloud.
 
 ## Security notes
 
-The initial proof of concept puts the ephemeral Tines API URL and run key in
-the Codex Cloud task prompt. This is deliberate so the remote agent can use
-the `tines` CLI, but it means the key may be visible to the Cloud task's prompt
-and retained in Cloud task history or provider logs. Treat the selected Cloud
-environment and repository as trusted, minimize access granted by the Tines
-key, and never reuse the key after the Tines run ends. The wrapper avoids
-printing the key and removes it from the environment inherited by the local
-`codex` subprocess, but this does not remove the prompt exposure.
+This proof of concept puts the ephemeral Tines API URL and run key in the
+Codex Cloud task prompt. The wrapper avoids printing the key and removes it
+from the environment inherited by the local `codex` subprocess, but the key
+can still enter task history, provider logs, model-visible tool output, or
+other retained task data. Do not use this path with production credentials.
+
+The formal threat model, option comparison, production design, and rollout gate
+are in [SECURITY.md](SECURITY.md). The recommended production path is a
+first-class Tines remote-runner handoff that injects a per-run credential only
+at the provider's Tines egress boundary. An attested scoped relay is the
+fallback when the provider cannot provide that capability; a static Cloud
+environment secret is not sufficient.
 
 ## Known limitations and follow-up work
 
