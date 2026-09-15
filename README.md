@@ -19,6 +19,7 @@ Tines custom runner
     ▼
 tines-codex-cloud
     ├── replaces the local-only preamble with a Cloud compatibility preamble
+    ├── gives bounded, on-demand guidance for loading relevant Tines skills
     ├── codex cloud exec --env <environment> [--branch <branch>] -
     └── polls codex cloud status <task-url>
              │
@@ -29,9 +30,11 @@ tines-codex-cloud
 
 The Cloud environment owns repository selection and the checkout. The wrapper
 does not clone Tines repository context locally and does not infer an
-environment from the Tines prompt. The environment must therefore be
-configured for the repository that the Tines context describes; this bridge
-does not silently select among multiple repositories.
+environment from the Tines prompt. Tines skill bodies are not copied into the
+Cloud prompt or checkout; the agent fetches selected skills from the Tines CLI
+only when needed. The environment must therefore be configured for the
+repository that the Tines context describes; this bridge does not silently
+select among multiple repositories.
 
 ## Prerequisites
 
@@ -135,8 +138,12 @@ available in Cloud.
 2. The bridge recognizes the Tines supervisor envelope and replaces its
    local-only authentication and workspace sections. It tells the agent to
    export the supplied credentials, use the Cloud environment's repository,
-   and treat local Tines paths in the original prompt as unavailable. The
-   contract and issue/workflow block are preserved unchanged.
+   and treat local Tines paths in the original prompt as unavailable. It also
+   explains how to inspect `tines issues context <project>/<number> --json`,
+   select only relevant skill entries, and fetch a selected item with
+   `tines context show <context-item-id> --json`. Skill bodies are not embedded
+   in the Cloud launch prompt. The contract and issue/workflow block are
+   preserved unchanged.
 3. The bridge submits that prompt to `codex cloud exec` with the selected
    environment and optional branch.
 4. It extracts the returned task URL and polls `codex cloud status` in the
@@ -183,7 +190,10 @@ environment secret is not sufficient.
 - The bridge does not yet validate that the selected Cloud environment matches
   every repository attached to the Tines issue; mapping is explicit and
   external.
-- Tines skills are not forwarded into Cloud.
+- Tines skill bodies are not forwarded into Cloud. The Cloud preamble gives the
+  agent on-demand loading guidance: select only relevant skills, fetch them by
+  context item ID, and keep the selected response bounded to 20 files and
+  100 KiB of UTF-8 content. The complete launch prompt is bounded to 256 KiB.
 - Environment, repository, and branch mapping is configured outside the
   wrapper.
 - Result bookkeeping is best effort: a Tines API/CLI outage does not change the

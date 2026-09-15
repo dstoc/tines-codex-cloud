@@ -152,6 +152,9 @@ Fix the reported behavior.
         self.assertNotIn("The runner daemon supplied the Tines key in the environment.", adapted)
         self.assertNotIn("fresh per-run workspace", adapted)
         self.assertIn("`AGENTS.md`", adapted)
+        self.assertIn("tines issues context Demo/7 --json", adapted)
+        self.assertIn("tines context show <context-item-id> --json", adapted)
+        self.assertIn("Tines skill files are not copied into this Cloud prompt", adapted)
 
     def test_adapt_resumed_prompt_does_not_make_a_new_cloud_task_claim_continuity(self) -> None:
         original = """# Supervisor run (resumed)
@@ -183,6 +186,26 @@ Fix the reported behavior.
         self.assertIn("Tines work", prompt)
         self.assertIn("bridge-owned `cloud-task` link artifact", prompt)
         self.assertIn("Do not fabricate a diff or PR artifact", prompt)
+
+    def test_build_cloud_prompt_guides_on_demand_skill_loading_without_embedding_files(self) -> None:
+        prompt = build_cloud_prompt(
+            "## Issue: demo/7 — use the checklist\n",
+            "https://tines.example/api",
+            "ephemeral-key",
+        )
+
+        self.assertIn("tines issues context demo/7 --json", prompt)
+        self.assertIn("tines context show <context-item-id> --json", prompt)
+        self.assertIn("at most 20 selected files and 100 KiB", prompt)
+        self.assertNotIn("## Forwarded Tines skill files", prompt)
+        self.assertNotIn("skills/<name>/SKILL.md", prompt)
+
+    def test_build_cloud_prompt_enforces_the_launch_prompt_size_limit(self) -> None:
+        with self.assertRaisesRegex(CloudCommandError, "exceeds the size limit"):
+            build_cloud_prompt("x" * 500, "https://tines.example/api", "key", max_prompt_bytes=100)
+
+        with self.assertRaisesRegex(CloudCommandError, "must be positive"):
+            build_cloud_prompt("prompt", "https://tines.example/api", "key", max_prompt_bytes=0)
 
     def test_required_environment_does_not_accept_missing_values(self) -> None:
         with self.assertRaisesRegex(CloudCommandError, "must be set"):
