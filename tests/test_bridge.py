@@ -10,6 +10,7 @@ from tines_codex_cloud.bridge import (
     CloudCommandError,
     CloudRunner,
     build_cloud_prompt,
+    check_prerequisites,
     extract_status,
     extract_task_reference,
     required_tines_environment,
@@ -30,6 +31,53 @@ class FakeCodex:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_check_prerequisites_runs_only_non_mutating_version_and_help_commands(self) -> None:
+        calls: list[list[str]] = []
+
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            self.assertNotIn("TINES_API_KEY", kwargs["env"])
+            self.assertNotIn("TINES_API_URL", kwargs["env"])
+            return subprocess.CompletedProcess(args, 0, "tool 1.2.3\n", "")
+
+        with patch.dict(
+            os.environ,
+            {"TINES_API_KEY": "secret", "TINES_API_URL": "https://tines.example"},
+        ):
+            checks = check_prerequisites(
+                codex_binary="/opt/codex",
+                tines_binary="/opt/tines",
+                run_command=command,
+            )
+
+        self.assertTrue(all(check.ok for check in checks))
+        self.assertEqual(
+            calls,
+            [
+                ["/opt/codex", "--version"],
+                ["/opt/codex", "cloud", "exec", "--help"],
+                ["/opt/codex", "cloud", "status", "--help"],
+                ["/opt/tines", "--version"],
+            ],
+        )
+
+    def test_check_prerequisites_reports_missing_executable_and_nonzero_help(self) -> None:
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[0] == "tines":
+                raise FileNotFoundError(args[0])
+            if args[2:4] == ["status", "--help"]:
+                return subprocess.CompletedProcess(args, 2, "", "unsupported")
+            return subprocess.CompletedProcess(args, 0, "ok\n", "")
+
+        checks = check_prerequisites(run_command=command)
+
+        self.assertTrue(checks[0].ok)
+        self.assertTrue(checks[1].ok)
+        self.assertFalse(checks[2].ok)
+        self.assertIn("exit code 2", checks[2].detail)
+        self.assertFalse(checks[3].ok)
+        self.assertEqual(checks[3].detail, "executable not found on PATH")
+
     def test_build_cloud_prompt_contains_override_credentials_and_original_prompt(self) -> None:
         prompt = build_cloud_prompt("Tines work\n", "https://tines.example/api", "key'with-quote")
 

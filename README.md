@@ -51,6 +51,10 @@ python3 -m pip install .
 tines-codex-cloud --help
 ```
 
+For the supported runner-host layout, version pinning, prerequisite checks,
+service PATH behavior, upgrades, and rollback, see
+[docs/installation.md](docs/installation.md).
+
 Codex authentication is intentionally outside this project. Authenticate the
 `codex` CLI as the OS user that runs the Tines runner, following the Codex CLI
 documentation for the deployment environment. Do not put the Tines run key in
@@ -78,6 +82,16 @@ The key is read only for prompt construction and is never printed by the
 wrapper. It is not written to disk. A successful Cloud task returns exit code
 0; a task in `ERROR`, a malformed Cloud response, or a local `codex` failure
 returns a non-zero exit code.
+
+Before installing or upgrading the bridge on a runner host, run the local
+prerequisite check as the service account:
+
+```sh
+tines-codex-cloud doctor
+```
+
+This checks the installed `codex` and `tines` executables and the two Codex
+Cloud subcommands without authenticating or submitting a task.
 
 ## Tines runner configuration
 
@@ -152,7 +166,8 @@ printing the key and removes it from the environment inherited by the local
   to the Tines issue.
 - Integration tests use mocked command execution; no real Codex Cloud task is
   created by the test suite.
-- Installation and upgrade packaging is only a basic Python package.
+- Release packaging and runner-host upgrade/rollback procedures are documented
+  in [docs/installation.md](docs/installation.md).
 
 These concerns are tracked in the Tines project as separate follow-up issues:
 
@@ -163,7 +178,6 @@ These concerns are tracked in the Tines project as separate follow-up issues:
 - Secure Tines credential delivery
 - Result and artifact integration
 - Testing with a fake `codex` executable
-- Packaging and installation
 
 ## Development
 

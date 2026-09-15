@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from typing import TextIO
@@ -110,6 +111,68 @@ def extract_status(output: str) -> str | None:
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class PrerequisiteCheck:
+    """Result of one executable or capability check."""
+
+    name: str
+    command: tuple[str, ...]
+    ok: bool
+    detail: str
+
+
+def _run_prerequisite_check(
+    name: str,
+    command: Sequence[str],
+    run_command: CommandRunner,
+) -> PrerequisiteCheck:
+    """Run a version/help check without exposing run-scoped credentials."""
+
+    command_tuple = tuple(command)
+    check_environment = os.environ.copy()
+    check_environment.pop("TINES_API_URL", None)
+    check_environment.pop("TINES_API_KEY", None)
+    try:
+        result = run_command(
+            list(command_tuple),
+            text=True,
+            capture_output=True,
+            env=check_environment,
+            check=False,
+        )
+    except FileNotFoundError:
+        return PrerequisiteCheck(name, command_tuple, False, "executable not found on PATH")
+    except OSError as exc:
+        return PrerequisiteCheck(name, command_tuple, False, str(exc.strerror or exc))
+
+    output = (result.stdout or result.stderr or "").strip().splitlines()
+    detail = output[0].strip() if output else f"exit code {result.returncode}"
+    if result.returncode != 0:
+        detail = f"exit code {result.returncode}: {detail}"
+    return PrerequisiteCheck(name, command_tuple, result.returncode == 0, detail)
+
+
+def check_prerequisites(
+    *,
+    codex_binary: str = "codex",
+    tines_binary: str = "tines",
+    run_command: CommandRunner = subprocess.run,
+) -> list[PrerequisiteCheck]:
+    """Check the local executables needed by a runner installation.
+
+    The checks are deliberately limited to version/help commands. They do not
+    authenticate, create a Cloud task, or contact the Tines API.
+    """
+
+    checks = [
+        ("Codex CLI", [codex_binary, "--version"]),
+        ("Codex Cloud exec", [codex_binary, "cloud", "exec", "--help"]),
+        ("Codex Cloud status", [codex_binary, "cloud", "status", "--help"]),
+        ("Tines CLI", [tines_binary, "--version"]),
+    ]
+    return [_run_prerequisite_check(name, command, run_command) for name, command in checks]
 
 
 class CloudRunner:

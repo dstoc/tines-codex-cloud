@@ -11,6 +11,7 @@ from .bridge import (
     CloudCommandError,
     CloudRunner,
     build_cloud_prompt,
+    check_prerequisites,
     read_prompt,
     required_tines_environment,
 )
@@ -34,6 +35,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="seconds between status checks (default: 5)",
     )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="check local Codex Cloud and Tines CLI prerequisites",
+    )
+    doctor_parser.add_argument(
+        "--codex-binary",
+        default="codex",
+        help="Codex executable to check (default: codex)",
+    )
+    doctor_parser.add_argument(
+        "--tines-binary",
+        default="tines",
+        help="Tines executable to check (default: tines)",
+    )
     return parser
 
 
@@ -47,12 +63,26 @@ def run_command(args: argparse.Namespace) -> int:
     return runner.run(cloud_prompt)
 
 
+def doctor_command(args: argparse.Namespace) -> int:
+    checks = check_prerequisites(
+        codex_binary=args.codex_binary,
+        tines_binary=args.tines_binary,
+    )
+    for check in checks:
+        status = "ok" if check.ok else "FAIL"
+        command = " ".join(check.command)
+        print(f"[{status}] {check.name}: {check.detail} ({command})")
+    return 0 if all(check.ok for check in checks) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
             return run_command(args)
+        if args.command == "doctor":
+            return doctor_command(args)
     except CloudCommandError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
