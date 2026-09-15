@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tines-codex-cloud"
+version = "0.1.0"
+description = "Experimental bridge from a Tines custom runner to Codex Cloud"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "UNLICENSED" }
+authors = [{ name = "Tines" }]
+dependencies = []
+
+[project.scripts]
+tines-codex-cloud = "tines_codex_cloud.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
