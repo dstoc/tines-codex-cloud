@@ -42,8 +42,9 @@ select among multiple repositories.
 - The `codex` CLI installed and authenticated on the Tines runner host, with
   access to `codex cloud exec` and `codex cloud status`.
 - The Tines `tines` CLI available on the runner host for bridge bookkeeping and
-  in the Codex Cloud environment when the agent needs to comment, attach
-  artifacts, or transition the originating issue.
+  for the pre-launch effective-context query. It must also be available in the
+  Codex Cloud environment when the agent needs to comment, attach artifacts,
+  or transition the originating issue.
 - A Codex Cloud environment already configured with the intended repository.
 
 ## Setup
@@ -136,14 +137,16 @@ available in Cloud.
 1. Tines launches the custom command with its generated prompt file and
    ephemeral credentials in the environment.
 2. The bridge recognizes the Tines supervisor envelope and replaces its
-   local-only authentication and workspace sections. It tells the agent to
-   export the supplied credentials, use the Cloud environment's repository,
-   and treat local Tines paths in the original prompt as unavailable. It also
-   explains how to inspect `tines issues context <project>/<number> --json`,
-   select only relevant skill entries, and fetch a selected item with
-   `tines context show <context-item-id> --json`. Skill bodies are not embedded
-   in the Cloud launch prompt. The contract and issue/workflow block are
-   preserved unchanged.
+   local-only authentication and workspace sections. For an issue prompt it
+   runs `tines issues context <project>/<number> --json` on the runner, keeps
+   only each effective skill's safe `item_id`, name, bounded description, and
+   file count, and adds that compact index to the Cloud prompt. It tells the
+   agent to export the supplied credentials, use the Cloud environment's
+   repository, and treat local Tines paths in the original prompt as
+   unavailable. Skill bodies are not embedded in the Cloud launch prompt; the
+   agent fetches a selected item with
+   `tines context show <context-item-id> --json`. The contract and
+   issue/workflow block are preserved unchanged.
 3. The bridge submits that prompt to `codex cloud exec` with the selected
    environment and optional branch.
 4. It extracts the returned task URL and polls `codex cloud status` in the
@@ -190,10 +193,13 @@ environment secret is not sufficient.
 - The bridge does not yet validate that the selected Cloud environment matches
   every repository attached to the Tines issue; mapping is explicit and
   external.
-- Tines skill bodies are not forwarded into Cloud. The Cloud preamble gives the
-  agent on-demand loading guidance: select only relevant skills, fetch them by
-  context item ID, and keep the selected response bounded to 20 files and
-  100 KiB of UTF-8 content. The complete launch prompt is bounded to 256 KiB.
+- Tines skill bodies are not forwarded into Cloud. The bridge's pre-launch
+  context query fails closed on an unavailable or malformed skill index; the
+  Cloud task is not submitted with an unverified skill list. The Cloud
+  preamble gives the agent on-demand loading guidance: select only relevant
+  skills, fetch them by context item ID, and keep the selected response bounded
+  to 20 files and 100 KiB of UTF-8 content. The complete launch prompt is
+  bounded to 256 KiB.
 - Environment, repository, and branch mapping is configured outside the
   wrapper.
 - Result bookkeeping is best effort: a Tines API/CLI outage does not change the
@@ -209,7 +215,6 @@ These concerns are tracked in the Tines project as separate follow-up issues:
 
 - Cloud task lifecycle robustness
 - Tines prompt adaptation
-- Skill forwarding
 - Repository and branch mapping
 - Secure Tines credential delivery
 - Result and artifact integration

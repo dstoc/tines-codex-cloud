@@ -1,9 +1,9 @@
 # Tines supervisor prompts in Codex Cloud
 
 This document records the prompt boundary for the experimental bridge. It
-addresses prompt adaptation only; credential delivery, repository mapping,
-skill forwarding, lifecycle handling, result integration, and packaging remain
-separate follow-up concerns.
+addresses prompt adaptation and the Cloud skill-discovery handoff; credential
+delivery, repository mapping, lifecycle handling, result integration, and
+packaging remain separate follow-up concerns.
 
 ## Decision
 
@@ -34,7 +34,7 @@ in the Cloud container.
 | --- | --- | --- | --- |
 | Repository | Tines materializes every effective repo and branch in the run workspace. | The configured Cloud environment owns checkout; the explicit environment and optional branch are passed to `codex cloud exec`. | Resolve and validate one Cloud environment against the effective Tines repository before launch. A multi-repository issue needs an explicit future design; do not silently choose one. |
 | Durable instructions | Tines prompt plus seeded skill files. | Cloud checkout `AGENTS.md` supplies repository instructions; the Tines project conventions remain in the preserved prompt. | Keep repository instructions in `AGENTS.md` and pass Tines workflow context as launch material. |
-| Tines skills | Files under `skills/<name>/…`. | Skill bodies are not embedded or mounted. The Cloud preamble tells the agent to read `tines issues context <project>/<number> --json`, select relevant `skills` entries by metadata, and fetch selected items with `tines context show <context-item-id> --json`. | Keep skills available through an explicit, bounded Cloud-native mechanism. Never claim a local path exists when it does not, and do not copy unrelated or secret-like skill content into prompts or issue artifacts. |
+| Tines skills | Files under `skills/<name>/…`. | The bridge queries `tines issues context <project>/<number> --json` before launch, places only validated IDs, names, bounded descriptions, and file counts in the prompt, and leaves bodies unembedded. The agent selects a relevant item and fetches it with `tines context show <context-item-id> --json`; returned `files[].path` values preserve the source structure. | Keep skills available through an explicit, bounded Cloud-native mechanism. Never claim a local path exists when it does not, and do not copy unrelated or secret-like skill content into prompts or issue artifacts. |
 | Credentials | Run-scoped `TINES_API_KEY` and `TINES_API_URL` are in the daemon process environment. | The bridge embeds the run key in the prompt as a temporary compatibility measure and tells the agent to export it. | Deliver the key out-of-band through a provider-supported per-task environment or egress proxy. The current prompt transport is tracked separately as a security issue and is not production-safe. |
 | Issue workflow | Agent uses the Tines CLI from the local workspace. | The preserved contract tells the agent to comment, transition, attach artifacts, and hand off through Tines. | Keep these instructions provider-neutral and make the run key available without adding credentials to prompt content. |
 

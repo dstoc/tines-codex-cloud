@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import unittest
@@ -17,7 +18,10 @@ from tines_codex_cloud.bridge import (
     extract_pull_request_url,
     extract_task_reference,
     parse_cloud_status,
+    parse_skill_metadata,
+    fetch_skill_metadata,
     required_tines_environment,
+    SkillMetadata,
 )
 
 
@@ -55,6 +59,17 @@ class FakeTines:
     def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         self.calls.append((args, kwargs))
         return subprocess.CompletedProcess(args, self.returncode, "", "private diagnostic")
+
+
+class SkillContextCommand:
+    def __init__(self, output: str, returncode: int = 0) -> None:
+        self.output = output
+        self.returncode = returncode
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, self.returncode, self.output, "private diagnostic")
 
 
 class BridgeTests(unittest.TestCase):
@@ -199,6 +214,105 @@ Fix the reported behavior.
         self.assertIn("at most 20 selected files and 100 KiB", prompt)
         self.assertNotIn("## Forwarded Tines skill files", prompt)
         self.assertNotIn("skills/<name>/SKILL.md", prompt)
+
+    def test_build_cloud_prompt_lists_prefetched_skill_metadata_without_file_bodies(self) -> None:
+        prompt = build_cloud_prompt(
+            "## Issue: demo/7 — use the checklist\n",
+            "https://tines.example/api",
+            "ephemeral-key",
+            skill_metadata=(
+                SkillMetadata(
+                    "ctx_review",
+                    "review-checklist",
+                    "Check the implementation before review.",
+                    2,
+                ),
+            ),
+        )
+
+        self.assertIn("tines issues context demo/7 --json", prompt)
+        self.assertIn("`review-checklist`", prompt)
+        self.assertIn("context item `ctx_review`", prompt)
+        self.assertIn("2 file(s)", prompt)
+        self.assertIn("Check the implementation before review.", prompt)
+        self.assertNotIn("file body", prompt)
+
+    def test_build_cloud_prompt_redacts_secret_like_prefetched_description(self) -> None:
+        prompt = build_cloud_prompt(
+            "## Issue: demo/7 — use the checklist\n",
+            "https://tines.example/api",
+            "ephemeral-key",
+            skill_metadata=(
+                SkillMetadata("ctx_unsafe", "unsafe", "api_key=ephemeral-key", 1),
+            ),
+        )
+
+        self.assertIn("context item `ctx_unsafe`", prompt)
+        self.assertIn("description omitted", prompt)
+        self.assertNotIn("description \"api_key=ephemeral-key\"", prompt)
+
+    def test_fetch_skill_metadata_uses_effective_context_and_discards_bodies(self) -> None:
+        command = SkillContextCommand(
+            json.dumps(
+                {
+                    "skills": [
+                        {
+                            "item_id": "ctx_review",
+                            "name": "review-checklist",
+                            "description": "Check the implementation.",
+                            "files": [
+                                {"path": "SKILL.md", "content": "private body"},
+                                {"path": "notes/extra.txt", "content": "more body"},
+                            ],
+                        }
+                    ],
+                    "prompt": {"text": "unrelated prompt"},
+                }
+            )
+        )
+        with patch.dict(
+            os.environ,
+            {"TINES_API_KEY": "ephemeral-key", "TINES_API_URL": "https://tines.example"},
+        ):
+            metadata = fetch_skill_metadata(
+                "demo/7",
+                tines_binary="/opt/tines",
+                run_command=command,
+                forbidden_values=("ephemeral-key",),
+            )
+
+        self.assertEqual(
+            metadata,
+            (SkillMetadata("ctx_review", "review-checklist", "Check the implementation.", 2),),
+        )
+        self.assertEqual(command.calls[0][0], ["/opt/tines", "issues", "context", "demo/7", "--json"])
+        self.assertIn("TINES_API_KEY", command.calls[0][1]["env"])
+        self.assertNotIn("private body", repr(metadata))
+
+    def test_parse_skill_metadata_omits_secret_like_descriptions(self) -> None:
+        metadata = parse_skill_metadata(
+            json.dumps(
+                {
+                    "skills": [
+                        {
+                            "item_id": "ctx_unsafe",
+                            "name": "unsafe",
+                            "description": "password=long-secret-value",
+                            "files": [{"path": "SKILL.md", "content": "body"}],
+                        }
+                    ]
+                }
+            )
+        )
+
+        self.assertEqual(metadata[0].description, None)
+
+    def test_fetch_skill_metadata_fails_without_leaking_cli_diagnostics(self) -> None:
+        command = SkillContextCommand("private diagnostic", returncode=17)
+
+        with self.assertRaisesRegex(CloudCommandError, "exit code 17"):
+            fetch_skill_metadata("demo/7", run_command=command)
+        self.assertNotIn("private diagnostic", str(command.calls))
 
     def test_build_cloud_prompt_enforces_the_launch_prompt_size_limit(self) -> None:
         with self.assertRaisesRegex(CloudCommandError, "exceeds the size limit"):
