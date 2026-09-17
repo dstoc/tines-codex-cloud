@@ -13,6 +13,7 @@ from .bridge import (
     CloudRunner,
     build_cloud_prompt,
     check_prerequisites,
+    default_cloud_state_file,
     extract_issue_reference,
     extract_tines_project,
     fetch_skill_metadata,
@@ -158,7 +159,12 @@ def run_command(args: argparse.Namespace) -> int:
         base_branch=target.base_branch,
         skill_metadata=skill_metadata,
     )
-    state_file = args.state_file or f"{args.prompt_file}.cloud-task.json"
+    state_file = args.state_file or default_cloud_state_file(
+        args.prompt_file,
+        issue_ref=issue_ref,
+        environment=target.environment,
+        branch=target.base_branch,
+    )
     runner = CloudRunner(
         target.environment,
         target.base_branch,

@@ -32,7 +32,10 @@ class CliTests(unittest.TestCase):
         ) as build, patch(
             "tines_codex_cloud.cli.CloudRunner",
             return_value=runner,
-        ) as runner_factory:
+        ) as runner_factory, patch(
+            "tines_codex_cloud.cli.default_cloud_state_file",
+            return_value="/var/lib/tines-codex-cloud/issue.cloud-task.json",
+        ) as state_file:
             status = main(
                 [
                     "run",
@@ -45,6 +48,12 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         fetch.assert_called_once_with("demo/7", forbidden_values=("ephemeral-key",))
+        state_file.assert_called_once_with(
+            "/tmp/prompt.md",
+            issue_ref="demo/7",
+            environment="example",
+            branch=None,
+        )
         build.assert_called_once_with(
             "## Issue: demo/7 — review\n",
             "https://tines.example",
@@ -64,7 +73,7 @@ class CliTests(unittest.TestCase):
             timeout=1800,
             status_retries=3,
             retry_backoff=0.5,
-            state_file="/tmp/prompt.md.cloud-task.json",
+            state_file="/var/lib/tines-codex-cloud/issue.cloud-task.json",
             cancel_timeout=5.0,
             cancel_on_timeout=True,
             cancel_on_interrupt=True,
@@ -121,7 +130,10 @@ class CliTests(unittest.TestCase):
         ), patch(
             "tines_codex_cloud.cli.CloudRunner",
             return_value=runner,
-        ) as cloud_runner:
+        ) as cloud_runner, patch(
+            "tines_codex_cloud.cli.default_cloud_state_file",
+            return_value="/var/lib/tines-codex-cloud/issue.cloud-task.json",
+        ):
             status = main(
                 [
                     "run",
@@ -143,7 +155,7 @@ class CliTests(unittest.TestCase):
             timeout=1800,
             status_retries=3,
             retry_backoff=0.5,
-            state_file="/tmp/prompt.md.cloud-task.json",
+            state_file="/var/lib/tines-codex-cloud/issue.cloud-task.json",
             cancel_timeout=5.0,
             cancel_on_timeout=True,
             cancel_on_interrupt=True,

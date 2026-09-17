@@ -12,12 +12,18 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the supported runner is Unix-like.
+    fcntl = None
 
 
 class CloudCommandError(RuntimeError):
@@ -44,6 +50,9 @@ MAX_CLOUD_PROMPT_BYTES = 256 * 1024
 MAX_SKILL_DESCRIPTION_CHARS = 512
 MAX_MODEL_ID_CHARS = 256
 CLOUD_DEFAULT_MODEL = "provider/default configuration"
+STATE_DIRECTORY_ENV = "TINES_CODEX_CLOUD_STATE_DIR"
+TINES_CONFIG_DIRECTORY_ENV = "TINES_CONFIG_DIR"
+STATE_DIRECTORY_NAME = "tines-codex-cloud"
 
 CONTEXT_ITEM_ID_PATTERN = re.compile(r"^ctx_[A-Za-z0-9_-]+$")
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
@@ -782,6 +791,57 @@ def extract_issue_reference(prompt: str) -> str | None:
     return f"{match.group('project').strip()}/{match.group('number')}"
 
 
+def default_cloud_state_directory() -> Path:
+    """Return the runner-managed directory for durable Cloud task state."""
+
+    configured = os.environ.get(STATE_DIRECTORY_ENV, "").strip()
+    if configured:
+        return Path(configured)
+
+    tines_config_directory = os.environ.get(TINES_CONFIG_DIRECTORY_ENV, "").strip()
+    if tines_config_directory:
+        return Path(tines_config_directory) / STATE_DIRECTORY_NAME
+
+    xdg_state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg_state_home:
+        return Path(xdg_state_home) / STATE_DIRECTORY_NAME
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / STATE_DIRECTORY_NAME
+
+    try:
+        return Path.home() / ".local" / "state" / STATE_DIRECTORY_NAME
+    except RuntimeError as exc:
+        raise CloudCommandError(
+            f"unable to determine a durable state directory; set {STATE_DIRECTORY_ENV}"
+        ) from exc
+
+
+def default_cloud_state_file(
+    prompt_file: str | Path,
+    *,
+    issue_ref: str | None,
+    environment: str,
+    branch: str | None,
+) -> Path:
+    """Choose a stable state path for a Tines issue across runner workspaces.
+
+    Issue prompts are regenerated in fresh workspace directories on retry, so
+    the prompt path cannot be part of the default state location. Prompts
+    without an issue reference retain the legacy prompt-adjacent behavior and
+    can opt into a shared path with ``--state-file``.
+    """
+
+    if issue_ref is None:
+        return Path(f"{prompt_file}.cloud-task.json")
+
+    scope = f"v1\0{issue_ref}\0{environment}\0{branch or ''}"
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return default_cloud_state_directory() / f"{digest}.cloud-task.json"
+
+
 def extract_task_reference(output: str) -> str | None:
     """Extract a Cloud task URL or explicitly labelled task identifier."""
 
@@ -1250,6 +1310,28 @@ class CloudRunner:
                     pass
             raise CloudCommandError(f"unable to save Cloud task state {self.state_file}") from exc
 
+    @contextmanager
+    def _submission_lock(self):
+        """Serialize the load/claim/submit transition for one state file."""
+
+        if self.state_file is None:
+            yield
+            return
+
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            lock_path = self.state_file.with_name(f".{self.state_file.name}.lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise CloudCommandError(f"unable to lock Cloud task state {self.state_file}") from exc
+
     def _load_task_state(
         self,
         prompt: str,
@@ -1477,26 +1559,27 @@ class CloudRunner:
         previous_handlers = self._install_signal_handlers()
         task_reference: str | None = None
         try:
-            task_reference = self._load_saved_task(prompt, issue_ref=issue_ref)
-            if task_reference is not None:
-                print(
-                    f"Resuming saved Cloud task {task_reference}; polling until completion.",
-                    file=self.output,
-                    flush=True,
-                )
-            else:
-                self._ensure_active(deadline)
-                # This intent is deliberately written before launching Cloud.
-                # If the wrapper dies after remote acceptance but before the
-                # CLI returns its reference, a retry must not create a second
-                # task whose relationship to the first cannot be established.
-                self._save_submission_intent(prompt, issue_ref=issue_ref)
-                task_reference = self.submit(
-                    prompt,
-                    timeout=max(deadline - self.monotonic(), 0.001),
-                )
-                self._save_task(prompt, task_reference, issue_ref=issue_ref)
-                print("Cloud task submitted; polling until completion.", file=self.output, flush=True)
+            with self._submission_lock():
+                task_reference = self._load_saved_task(prompt, issue_ref=issue_ref)
+                if task_reference is not None:
+                    print(
+                        f"Resuming saved Cloud task {task_reference}; polling until completion.",
+                        file=self.output,
+                        flush=True,
+                    )
+                else:
+                    self._ensure_active(deadline)
+                    # This intent is deliberately written before launching Cloud.
+                    # If the wrapper dies after remote acceptance but before the
+                    # CLI returns its reference, a retry must not create a second
+                    # task whose relationship to the first cannot be established.
+                    self._save_submission_intent(prompt, issue_ref=issue_ref)
+                    task_reference = self.submit(
+                        prompt,
+                        timeout=max(deadline - self.monotonic(), 0.001),
+                    )
+                    self._save_task(prompt, task_reference, issue_ref=issue_ref)
+                    print("Cloud task submitted; polling until completion.", file=self.output, flush=True)
 
             self._record_task_link(issue_ref, task_reference)
             self._active_task_reference = task_reference

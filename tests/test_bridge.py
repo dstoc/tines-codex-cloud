@@ -18,6 +18,7 @@ from tines_codex_cloud.bridge import (
     adapt_supervisor_prompt,
     build_cloud_prompt,
     check_prerequisites,
+    default_cloud_state_file,
     extract_status,
     extract_issue_reference,
     extract_pull_request_url,
@@ -30,6 +31,7 @@ from tines_codex_cloud.bridge import (
     required_tines_environment,
     resolve_cloud_target,
     SkillMetadata,
+    STATE_DIRECTORY_ENV,
 )
 
 
@@ -81,6 +83,33 @@ class SkillContextCommand:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_default_cloud_state_file_is_stable_across_fresh_prompt_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as state_directory:
+            with patch.dict(os.environ, {STATE_DIRECTORY_ENV: state_directory}, clear=False):
+                first = default_cloud_state_file(
+                    "/runner/workspaces/run-one/prompt.md",
+                    issue_ref="demo/7",
+                    environment="example",
+                    branch="main",
+                )
+                second = default_cloud_state_file(
+                    "/runner/workspaces/run-two/prompt.md",
+                    issue_ref="demo/7",
+                    environment="example",
+                    branch="main",
+                )
+                different_issue = default_cloud_state_file(
+                    "/runner/workspaces/run-three/prompt.md",
+                    issue_ref="demo/8",
+                    environment="example",
+                    branch="main",
+                )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different_issue)
+        self.assertEqual(first.parent, Path(state_directory))
+        self.assertTrue(first.name.endswith(".cloud-task.json"))
+
     def test_launch_configuration_keeps_resolved_model_out_of_current_exec_argv(self) -> None:
         configuration = CloudLaunchConfiguration(
             environment="example",

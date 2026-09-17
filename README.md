@@ -135,17 +135,28 @@ Use `--status-retries`, `--retry-backoff`, `--timeout`, `--cancel-timeout`, and
 `codex cloud cancel` are cancelled on timeout or interruption; older versions
 are reported as still active.
 
-The CLI writes a prompt-scoped state file at
-`<prompt-file>.cloud-task.json` by default. It contains a fingerprint and,
-after a successful submission response, the Cloud task reference. The
-fingerprint uses the issue reference, Cloud environment, branch, and state-file
-identity, not volatile run headers, credentials, or refreshed issue context. The bridge
-writes a durable submission intent before calling `codex cloud exec`. If the
-wrapper stops while submission is ambiguous, a retry refuses to submit a
-duplicate task; inspect the provider and remove the state file only after
-confirming that no task was accepted. Once a known task exists, a later run
-resumes status polling instead of submitting again. Terminal tasks clear the
-state file.
+For issue prompts, the CLI writes state in a durable runner-managed directory
+by default: `$TINES_CONFIG_DIR/tines-codex-cloud/` when the Tines runner
+config directory is supplied, `$XDG_STATE_HOME/tines-codex-cloud/` when that
+variable is set, or `~/.local/state/tines-codex-cloud/` otherwise. Set
+`TINES_CODEX_CLOUD_STATE_DIR` to choose an explicit service-account directory
+and override those defaults.
+The filename is a hash of the Tines issue reference, Cloud environment, and
+branch, so retries from fresh `prompt.md` workspaces use the same state file.
+Prompts without an issue reference retain the prompt-adjacent
+`<prompt-file>.cloud-task.json` default; use `--state-file` when those tasks
+also need cross-process recovery.
+
+The state contains a fingerprint and, after a successful submission response,
+the Cloud task reference. The fingerprint uses the issue reference, Cloud
+environment, branch, and state-file identity, not volatile run headers,
+credentials, or refreshed issue context. The bridge writes a durable
+submission intent before calling `codex cloud exec` and serializes the
+load/claim/submit transition for concurrent retries. If the wrapper stops while
+submission is ambiguous, a retry refuses to submit a duplicate task; inspect
+the provider and remove the state file only after confirming that no task was
+accepted. Once a known task exists, a later run resumes status polling instead
+of submitting again. Terminal tasks clear the state file.
 
 Before installing or upgrading the bridge on a runner host, run the local
 prerequisite check as the service account:
@@ -286,7 +297,7 @@ override.
    agent fetches a selected item with
    `tines context show <context-item-id> --json`. The contract and
    issue/workflow block are preserved unchanged.
-3. The bridge writes a prompt-scoped submission intent, then submits that
+3. The bridge writes a durable, issue-scoped submission intent, then submits that
    prompt to `codex cloud exec` with the selected environment and optional
    branch. The command receives the remaining overall deadline.
 4. It extracts the returned task URL, persists it, and polls
@@ -295,9 +306,11 @@ override.
    are retried with bounded exponential backoff; `PENDING` and other
    recognized in-progress states continue polling; `READY` succeeds and
    `ERROR` fails.
-5. If the wrapper is interrupted or killed, the state file remains. A known
-   task reference can be resumed without a second `cloud exec`; an interrupted
-   submission remains an explicit recovery stop that refuses automatic replay.
+5. If the wrapper is interrupted or killed, the durable state file remains even
+   when Tines deletes the failed run workspace. A known task reference can be
+   resumed without a second `cloud exec`; an interrupted submission remains an
+   explicit recovery stop that refuses automatic replay. Concurrent retries
+   serialize the submission claim before either can call `cloud exec`.
    The bridge attempts `codex cloud cancel` on timeout or interruption when
    available, with a separate bounded cleanup timeout.
 6. When the generated prompt contains an issue header and the submission

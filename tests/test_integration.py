@@ -210,3 +210,78 @@ class FakeCodexIntegrationTests(unittest.TestCase):
         self.assertEqual(result.stdout, "Cloud task submitted; polling until completion.\n")
         self.assertEqual([record["operation"] for record in records], ["exec", "status", "status", "status", "status"])
         self.assert_no_credentials_in_logs(result)
+
+    def test_retry_in_fresh_workspace_reuses_durable_task_without_second_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_directory = root / "durable-state"
+            first_workspace = root / "run-one"
+            second_workspace = root / "run-two"
+            first_workspace.mkdir()
+            second_workspace.mkdir()
+
+            def run_in_workspace(
+                workspace: Path,
+                scenario: str,
+            ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+                prompt_path = workspace / "prompt.md"
+                log_path = workspace / "fake-codex.jsonl"
+                fake_state_path = workspace / "fake-codex.state"
+                prompt_path.write_text("## Issue: demo/7 — durable retry\n", encoding="utf-8")
+
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "FAKE_CODEX_LOG": str(log_path),
+                        "FAKE_CODEX_SCENARIO": scenario,
+                        "FAKE_CODEX_STATE": str(fake_state_path),
+                        "FAKE_FAILURE_MARKER": self.api_key,
+                        "PYTHONPATH": str(ROOT / "src"),
+                        "TINES_API_KEY": self.api_key,
+                        "TINES_API_URL": self.api_url,
+                        "TINES_CODEX_CLOUD_STATE_DIR": str(state_directory),
+                    }
+                )
+                environment["PATH"] = os.pathsep.join(
+                    [str(FAKE_CODEX), environment.get("PATH", "")]
+                )
+
+                command = [
+                    sys.executable,
+                    "-m",
+                    "tines_codex_cloud.cli",
+                    "run",
+                    "--env",
+                    "integration",
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--poll-interval",
+                    "0",
+                    "--status-retries",
+                    "0",
+                ]
+                result = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                records = [
+                    json.loads(line)
+                    for line in log_path.read_text(encoding="utf-8").splitlines()
+                ]
+                return result, records
+
+            first_result, first_records = run_in_workspace(first_workspace, "status-process-failure")
+            second_result, second_records = run_in_workspace(second_workspace, "successful-submission")
+
+            self.assertEqual(first_result.returncode, 1)
+            self.assertIn("after 1 attempt(s)", first_result.stderr)
+            self.assertEqual([record["operation"] for record in first_records], ["exec", "status"])
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            self.assertIn("Resuming saved Cloud task", second_result.stdout)
+            self.assertNotIn("Cloud task submitted", second_result.stdout)
+            self.assertEqual([record["operation"] for record in second_records], ["status"])
+            self.assertFalse(list(state_directory.glob("*.cloud-task.json")))
