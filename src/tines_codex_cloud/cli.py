@@ -63,6 +63,39 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="seconds between status checks (default: 5)",
     )
+    run_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30 * 60,
+        help="overall seconds to wait after launch (default: 1800)",
+    )
+    run_parser.add_argument(
+        "--status-retries",
+        type=int,
+        default=3,
+        help="retries for transient status command failures (default: 3)",
+    )
+    run_parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=0.5,
+        help="initial seconds for exponential status retry backoff (default: 0.5)",
+    )
+    run_parser.add_argument(
+        "--state-file",
+        help="path for resumable Cloud task state (default: <prompt-file>.cloud-task.json)",
+    )
+    run_parser.add_argument(
+        "--cancel-timeout",
+        type=float,
+        default=5.0,
+        help="maximum seconds for best-effort cancellation (default: 5)",
+    )
+    run_parser.add_argument(
+        "--no-cancel",
+        action="store_true",
+        help="leave the Cloud task running when the local wrapper times out or is interrupted",
+    )
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -84,6 +117,14 @@ def build_parser() -> argparse.ArgumentParser:
 def run_command(args: argparse.Namespace) -> int:
     if not isfinite(args.poll_interval) or args.poll_interval < 0:
         raise CloudCommandError("--poll-interval must be a finite, non-negative number")
+    if not isfinite(args.timeout) or args.timeout <= 0:
+        raise CloudCommandError("--timeout must be a finite, positive number")
+    if args.status_retries < 0:
+        raise CloudCommandError("--status-retries must be a non-negative integer")
+    if not isfinite(args.retry_backoff) or args.retry_backoff < 0:
+        raise CloudCommandError("--retry-backoff must be a finite, non-negative number")
+    if not isfinite(args.cancel_timeout) or args.cancel_timeout <= 0:
+        raise CloudCommandError("--cancel-timeout must be finite and positive")
     api_url, api_key = required_tines_environment()
     original_prompt = read_prompt(args.prompt_file)
     mapping = load_cloud_mapping(args.config) if args.config else CloudMapping()
@@ -117,11 +158,19 @@ def run_command(args: argparse.Namespace) -> int:
         base_branch=target.base_branch,
         skill_metadata=skill_metadata,
     )
+    state_file = args.state_file or f"{args.prompt_file}.cloud-task.json"
     runner = CloudRunner(
         target.environment,
         target.base_branch,
         args.poll_interval,
         model=args.model,
+        timeout=args.timeout,
+        status_retries=args.status_retries,
+        retry_backoff=args.retry_backoff,
+        state_file=state_file,
+        cancel_timeout=args.cancel_timeout,
+        cancel_on_timeout=not args.no_cancel,
+        cancel_on_interrupt=not args.no_cancel,
     )
     return runner.run(cloud_prompt, issue_ref=issue_ref)
 

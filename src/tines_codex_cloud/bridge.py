@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -19,6 +22,18 @@ from urllib.parse import urlsplit
 
 class CloudCommandError(RuntimeError):
     """Raised when the local Codex CLI cannot complete a command."""
+
+
+class _TransientCloudCommandError(CloudCommandError):
+    """An execution failure that is safe to retry for a status read."""
+
+
+class _CloudTaskTimeout(CloudCommandError):
+    """The local wait deadline elapsed while the Cloud task was still active."""
+
+
+class _CloudTaskInterrupted(CloudCommandError):
+    """The local wrapper was asked to stop while a Cloud task was active."""
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -968,17 +983,36 @@ class CloudRunner:
         poll_interval: float = 5.0,
         *,
         model: str | None = None,
+        timeout: float = 30 * 60,
+        status_retries: int = 3,
+        retry_backoff: float = 0.5,
+        max_retry_backoff: float = 30.0,
+        state_file: str | Path | None = None,
+        cancel_on_timeout: bool = True,
+        cancel_on_interrupt: bool = True,
+        cancel_timeout: float = 5.0,
         codex_binary: str = "codex",
         run_command: CommandRunner = subprocess.run,
         tines_binary: str = "tines",
         run_tines_command: TinesCommandRunner = subprocess.run,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
         output: TextIO = sys.stdout,
     ) -> None:
         if not environment.strip():
             raise CloudCommandError("Cloud environment must not be empty")
         if not isfinite(poll_interval) or poll_interval < 0:
             raise CloudCommandError("poll interval must be a finite, non-negative number")
+        if not isfinite(timeout) or timeout <= 0:
+            raise CloudCommandError("timeout must be a finite, positive number")
+        if not isinstance(status_retries, int) or isinstance(status_retries, bool) or status_retries < 0:
+            raise CloudCommandError("status retries must be a non-negative integer")
+        if not isfinite(retry_backoff) or retry_backoff < 0:
+            raise CloudCommandError("retry backoff must be a finite, non-negative number")
+        if not isfinite(max_retry_backoff) or max_retry_backoff < 0:
+            raise CloudCommandError("maximum retry backoff must be a finite, non-negative number")
+        if not isfinite(cancel_timeout) or cancel_timeout <= 0:
+            raise CloudCommandError("cancel timeout must be finite and positive")
         self.environment = environment
         self.branch = branch
         self.poll_interval = poll_interval
@@ -991,13 +1025,24 @@ class CloudRunner:
         # Tines-resolved value; launch_configuration remains the source of
         # truth for command construction and diagnostics.
         self.model = self.launch_configuration.resolved_model
+        self.timeout = timeout
+        self.status_retries = status_retries
+        self.retry_backoff = retry_backoff
+        self.max_retry_backoff = max_retry_backoff
+        self.state_file = Path(state_file) if state_file is not None else None
+        self.cancel_on_timeout = cancel_on_timeout
+        self.cancel_on_interrupt = cancel_on_interrupt
+        self.cancel_timeout = cancel_timeout
         self.codex_binary = codex_binary
         self.run_command = run_command
         self.tines_binary = tines_binary
         self.run_tines_command = run_tines_command
         self.sleep = sleep
+        self.monotonic = monotonic
         self.output = output
         self.last_status: CloudStatus | None = None
+        self._stop_requested = False
+        self._active_task_reference: str | None = None
 
     @property
     def launch_metadata(self) -> dict[str, str | None]:
@@ -1014,17 +1059,24 @@ class CloudRunner:
         self,
         arguments: Sequence[str],
         input_text: str | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [self.codex_binary, *arguments]
+        options: dict[str, object] = {
+            "input": input_text,
+            "text": True,
+            "capture_output": True,
+            "env": self._safe_environment(),
+            "check": False,
+        }
+        if timeout is not None:
+            options["timeout"] = timeout
         try:
-            return self.run_command(
-                command,
-                input=input_text,
-                text=True,
-                capture_output=True,
-                env=self._safe_environment(),
-                check=False,
-            )
+            return self.run_command(command, **options)
+        except subprocess.TimeoutExpired as exc:
+            raise _TransientCloudCommandError(
+                f"{self.codex_binary} {' '.join(arguments[:2])} command timed out"
+            ) from exc
         except FileNotFoundError as exc:
             raise CloudCommandError(
                 f"unable to execute {self.codex_binary!r}; install and authenticate the Codex CLI"
@@ -1134,8 +1186,226 @@ class CloudRunner:
         if result is None or result.returncode != 0:
             self._warn_integration_failure("record the Cloud task result on the Tines issue")
 
-    def submit(self, prompt: str) -> str:
-        result = self._execute(self.launch_configuration.codex_exec_arguments(), input_text=prompt)
+    def _scope_fingerprint(self, prompt: str, *, issue_ref: str | None = None) -> str:
+        """Hash stable task scope rather than volatile run-prompt contents.
+
+        Tines regenerates the supervisor header, credentials, and sometimes
+        effective context on every invocation. The issue reference, Cloud
+        environment, branch, and selected state path identify the recoverable
+        task while keeping a state file from another task from being reused.
+        """
+
+        stable_issue_ref = issue_ref if issue_ref is not None else extract_issue_reference(prompt)
+        state_identity = str(self.state_file.resolve()) if self.state_file is not None else ""
+        scope = f"v3\0{self.environment}\0{self.branch or ''}\0{stable_issue_ref or ''}\0{state_identity}"
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+    def _write_task_state(
+        self,
+        prompt: str,
+        *,
+        phase: str,
+        task_reference: str | None = None,
+        issue_ref: str | None = None,
+    ) -> None:
+        """Atomically persist submission intent or a known task reference."""
+
+        if self.state_file is None:
+            return
+        if phase not in {"submitting", "submitted"}:
+            raise CloudCommandError(f"invalid Cloud task state phase {phase!r}")
+        if phase == "submitting" and task_reference is not None:
+            raise CloudCommandError("a submitting Cloud task state cannot contain a task reference")
+        if phase == "submitted" and not task_reference:
+            raise CloudCommandError("a submitted Cloud task state requires a task reference")
+
+        parent = self.state_file.parent
+        temporary_path: Path | None = None
+        try:
+            state_payload: dict[str, object] = {
+                "version": 3,
+                "phase": phase,
+                "fingerprint": self._scope_fingerprint(prompt, issue_ref=issue_ref),
+            }
+            if task_reference is not None:
+                state_payload["task_reference"] = task_reference
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=parent,
+                prefix=f".{self.state_file.name}.",
+                delete=False,
+            ) as temporary:
+                json.dump(state_payload, temporary)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, self.state_file)
+        except OSError as exc:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise CloudCommandError(f"unable to save Cloud task state {self.state_file}") from exc
+
+    def _load_task_state(
+        self,
+        prompt: str,
+        *,
+        issue_ref: str | None = None,
+    ) -> tuple[str, str | None] | None:
+        if self.state_file is None or not self.state_file.exists():
+            return None
+        try:
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CloudCommandError(f"unable to read Cloud task state {self.state_file}") from exc
+        if not isinstance(state, dict):
+            raise CloudCommandError(f"Cloud task state {self.state_file} is not an object")
+        if state.get("fingerprint") != self._scope_fingerprint(prompt, issue_ref=issue_ref):
+            raise CloudCommandError(
+                f"Cloud task state {self.state_file} belongs to a different prompt; "
+                "remove it only after confirming the recorded task is no longer active"
+            )
+
+        task_reference = state.get("task_reference")
+        if task_reference is not None and (
+            not isinstance(task_reference, str) or not task_reference
+        ):
+            raise CloudCommandError(f"Cloud task state {self.state_file} has an invalid task reference")
+
+        phase = state.get("phase")
+        if phase is None:
+            # Version 1 files from the first lifecycle implementation did not
+            # record a phase. A task reference is unambiguously submitted.
+            phase = "submitted" if task_reference else "submitting"
+        if phase not in {"submitting", "submitted"}:
+            raise CloudCommandError(f"Cloud task state {self.state_file} has an invalid phase")
+        if phase == "submitting" and task_reference is not None:
+            raise CloudCommandError(f"Cloud task state {self.state_file} is inconsistent")
+        if phase == "submitted" and task_reference is None:
+            raise CloudCommandError(f"Cloud task state {self.state_file} has no task reference")
+        return phase, task_reference
+
+    def _load_saved_task(self, prompt: str, *, issue_ref: str | None = None) -> str | None:
+        """Load a known task, refusing to replay an ambiguous submission."""
+
+        state = self._load_task_state(prompt, issue_ref=issue_ref)
+        if state is None:
+            return None
+        phase, task_reference = state
+        if phase == "submitting":
+            raise CloudCommandError(
+                f"Cloud task submission may have been accepted before the wrapper stopped; "
+                f"refusing to submit a duplicate. Inspect the provider and state file "
+                f"{self.state_file} before removing it"
+            )
+        assert task_reference is not None
+        return task_reference
+
+    def _save_submission_intent(self, prompt: str, *, issue_ref: str | None = None) -> None:
+        self._write_task_state(prompt, phase="submitting", issue_ref=issue_ref)
+
+    def _save_task(
+        self,
+        prompt: str,
+        task_reference: str,
+        *,
+        issue_ref: str | None = None,
+    ) -> None:
+        self._write_task_state(
+            prompt,
+            phase="submitted",
+            task_reference=task_reference,
+            issue_ref=issue_ref,
+        )
+
+    def _clear_task(self) -> None:
+        if self.state_file is None:
+            return
+        try:
+            self.state_file.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                f"warning: unable to clear Cloud task state {self.state_file}: {exc}",
+                file=self.output,
+                flush=True,
+            )
+
+    def _ensure_active(self, deadline: float) -> None:
+        if self._stop_requested:
+            raise _CloudTaskInterrupted("local wrapper interrupted")
+        if self.monotonic() >= deadline:
+            raise _CloudTaskTimeout("overall Cloud task timeout exceeded")
+
+    def _retry_delay(self, retry_number: int) -> float:
+        return min(self.retry_backoff * (2**retry_number), self.max_retry_backoff)
+
+    def _status(self, task_reference: str, deadline: float) -> CloudStatus:
+        last_error = "status command failed"
+        for attempt in range(self.status_retries + 1):
+            self._ensure_active(deadline)
+            remaining = deadline - self.monotonic()
+            try:
+                result = self._execute(
+                    ["cloud", "status", task_reference],
+                    timeout=max(remaining, 0.001),
+                )
+            except _TransientCloudCommandError as exc:
+                # The status command was given the complete remaining
+                # deadline, so its timeout is the overall timeout boundary,
+                # not an independent retryable failure.
+                if "command timed out" in str(exc):
+                    raise _CloudTaskTimeout("status command exceeded overall Cloud task timeout") from exc
+                last_error = str(exc)
+            else:
+                if result.returncode == 0:
+                    parsed = parse_cloud_status(result.stdout)
+                    if parsed is not None:
+                        return parsed
+                    last_error = "codex cloud status returned no recognized task status"
+                else:
+                    last_error = f"codex cloud status failed with exit code {result.returncode}"
+
+            if attempt >= self.status_retries:
+                raise CloudCommandError(f"{last_error} after {attempt + 1} attempt(s)")
+            delay = self._retry_delay(attempt)
+            if delay:
+                self._ensure_active(deadline)
+                self.sleep(min(delay, max(deadline - self.monotonic(), 0.0)))
+        raise AssertionError("status retry loop did not return or raise")
+
+    def _install_signal_handlers(self) -> dict[int, object]:
+        previous: dict[int, object] = {}
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            self._stop_requested = True
+
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, request_stop)
+        except (OSError, ValueError):
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            return {}
+        return previous
+
+    def _restore_signal_handlers(self, previous: dict[int, object]) -> None:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+
+    def submit(self, prompt: str, *, timeout: float | None = None) -> str:
+        arguments = self.launch_configuration.codex_exec_arguments()
+        try:
+            result = self._execute(arguments, input_text=prompt, timeout=timeout)
+        except _TransientCloudCommandError as exc:
+            raise CloudCommandError("codex cloud exec command timed out") from exc
         if result.returncode != 0:
             raise CloudCommandError(f"codex cloud exec failed with exit code {result.returncode}")
         task_reference = extract_task_reference(result.stdout)
@@ -1143,27 +1413,53 @@ class CloudRunner:
             raise CloudCommandError("codex cloud exec returned no task URL or task identifier")
         return task_reference
 
-    def poll(self, task_reference: str) -> bool:
-        """Poll until READY or ERROR; return whether the task succeeded."""
+    def cancel(self, task_reference: str, *, timeout: float | None = None) -> bool:
+        """Best-effort cancellation for Codex versions that expose the command."""
 
+        try:
+            result = self._execute(
+                ["cloud", "cancel", task_reference],
+                timeout=self.cancel_timeout if timeout is None else timeout,
+            )
+        except CloudCommandError:
+            return False
+        return result.returncode == 0
+
+    def _cancel_after_local_stop(self, task_reference: str, reason: str) -> None:
+        cancelled = self.cancel(task_reference)
+        if cancelled:
+            print(
+                f"Cloud task cancellation requested after local {reason}.",
+                file=self.output,
+                flush=True,
+            )
+        else:
+            state_hint = f"; state retained in {self.state_file}" if self.state_file is not None else ""
+            print(
+                f"Cloud task remains active after local {reason}; Codex cancellation is unavailable or failed{state_hint}.",
+                file=self.output,
+                flush=True,
+            )
+
+    def poll(self, task_reference: str, *, deadline: float | None = None) -> bool:
+        """Poll until a terminal state; return whether the task succeeded."""
+
+        if deadline is None:
+            deadline = self.monotonic() + self.timeout
         self.last_status = None
         while True:
-            result = self._execute(["cloud", "status", task_reference])
-            if result.returncode != 0:
-                raise CloudCommandError(
-                    f"codex cloud status failed with exit code {result.returncode}"
-                )
-            parsed = parse_cloud_status(result.stdout)
-            if parsed is None:
-                raise CloudCommandError("codex cloud status returned no recognized task status")
+            status = self._status(task_reference, deadline)
+            if self._stop_requested:
+                raise _CloudTaskInterrupted("local wrapper interrupted")
 
-            self.last_status = parsed
-            print(f"Cloud task status: {parsed.state}", file=self.output, flush=True)
-            if parsed.state == "READY":
+            self.last_status = status
+            print(f"Cloud task status: {status.state}", file=self.output, flush=True)
+            if status.state == "READY":
                 return True
-            if parsed.state == "ERROR":
+            if status.state == "ERROR":
                 return False
-            self.sleep(self.poll_interval)
+            self._ensure_active(deadline)
+            self.sleep(min(self.poll_interval, max(deadline - self.monotonic(), 0.0)))
 
     def run(self, prompt: str, *, issue_ref: str | None = None) -> int:
         """Submit and synchronously wait for the Cloud task."""
@@ -1176,16 +1472,65 @@ class CloudRunner:
                 file=self.output,
                 flush=True,
             )
-        task_reference = self.submit(prompt)
-        self._record_task_link(issue_ref, task_reference)
-        print("Cloud task submitted; polling until completion.", file=self.output, flush=True)
+        deadline = self.monotonic() + self.timeout
+        self._stop_requested = False
+        previous_handlers = self._install_signal_handlers()
+        task_reference: str | None = None
         try:
-            succeeded = self.poll(task_reference)
-        except CloudCommandError as exc:
-            self._record_result_comment(issue_ref, task_reference, status=None, failure=str(exc))
-            raise
-        self._record_result_comment(issue_ref, task_reference, status=self.last_status)
-        return 0 if succeeded else 1
+            task_reference = self._load_saved_task(prompt, issue_ref=issue_ref)
+            if task_reference is not None:
+                print(
+                    f"Resuming saved Cloud task {task_reference}; polling until completion.",
+                    file=self.output,
+                    flush=True,
+                )
+            else:
+                self._ensure_active(deadline)
+                # This intent is deliberately written before launching Cloud.
+                # If the wrapper dies after remote acceptance but before the
+                # CLI returns its reference, a retry must not create a second
+                # task whose relationship to the first cannot be established.
+                self._save_submission_intent(prompt, issue_ref=issue_ref)
+                task_reference = self.submit(
+                    prompt,
+                    timeout=max(deadline - self.monotonic(), 0.001),
+                )
+                self._save_task(prompt, task_reference, issue_ref=issue_ref)
+                print("Cloud task submitted; polling until completion.", file=self.output, flush=True)
+
+            self._record_task_link(issue_ref, task_reference)
+            self._active_task_reference = task_reference
+            try:
+                succeeded = self.poll(task_reference, deadline=deadline)
+            except _CloudTaskTimeout as exc:
+                if self.cancel_on_timeout:
+                    self._cancel_after_local_stop(task_reference, "timeout")
+                failure = CloudCommandError(f"Cloud task timed out: {exc}")
+                self._record_result_comment(issue_ref, task_reference, status=self.last_status, failure=str(failure))
+                raise failure from exc
+            except _CloudTaskInterrupted as exc:
+                if self.cancel_on_interrupt:
+                    self._cancel_after_local_stop(task_reference, "interruption")
+                failure = CloudCommandError(f"Cloud task interrupted: {exc}")
+                self._record_result_comment(issue_ref, task_reference, status=self.last_status, failure=str(failure))
+                raise failure from exc
+            except KeyboardInterrupt as exc:
+                self._stop_requested = True
+                if self.cancel_on_interrupt:
+                    self._cancel_after_local_stop(task_reference, "interruption")
+                failure = CloudCommandError("Cloud task interrupted by keyboard")
+                self._record_result_comment(issue_ref, task_reference, status=self.last_status, failure=str(failure))
+                raise failure from exc
+            except CloudCommandError as exc:
+                self._record_result_comment(issue_ref, task_reference, status=self.last_status, failure=str(exc))
+                raise
+
+            self._record_result_comment(issue_ref, task_reference, status=self.last_status)
+            self._clear_task()
+            return 0 if succeeded else 1
+        finally:
+            self._active_task_reference = None
+            self._restore_signal_handlers(previous_handlers)
 
 
 def read_prompt(path: str | Path) -> str:

@@ -1,8 +1,8 @@
 # tines-codex-cloud
 
 > **Experimental:** this is a proof of concept for running a Tines custom runner
-> through Codex Cloud. The credential handoff and lifecycle handling are not yet
-> suitable for production without the follow-up work listed below.
+> through Codex Cloud. The credential handoff is not yet suitable for production
+> without the follow-up work listed below.
 
 `tines-codex-cloud` is a small command-line bridge. It receives the prompt that
 Tines generated for a local runner, submits a Codex Cloud task, and stays alive
@@ -99,7 +99,8 @@ tines-codex-cloud run \
   --config /etc/tines-codex-cloud/mapping.json \
   --prompt-file /path/to/prompt.md \
   --model gpt-5.6-sol \
-  --poll-interval 5
+  --poll-interval 5 \
+  --timeout 1800
 ```
 
 `--branch` is optional; omit it when the mapping or Cloud environment's
@@ -126,6 +127,25 @@ The key is read only for prompt construction and is never printed by the
 wrapper. It is not written to disk. A successful Cloud task returns exit code
 0; a task in `ERROR`, a malformed Cloud response, or a local `codex` failure
 returns a non-zero exit code.
+
+The wrapper retries transient status-command failures three times with
+exponential backoff, then stops at the overall timeout (30 minutes by default).
+Use `--status-retries`, `--retry-backoff`, `--timeout`, `--cancel-timeout`, and
+`--no-cancel` to tune that behavior. Codex versions that provide
+`codex cloud cancel` are cancelled on timeout or interruption; older versions
+are reported as still active.
+
+The CLI writes a prompt-scoped state file at
+`<prompt-file>.cloud-task.json` by default. It contains a fingerprint and,
+after a successful submission response, the Cloud task reference. The
+fingerprint uses the issue reference, Cloud environment, branch, and state-file
+identity, not volatile run headers, credentials, or refreshed issue context. The bridge
+writes a durable submission intent before calling `codex cloud exec`. If the
+wrapper stops while submission is ambiguous, a retry refuses to submit a
+duplicate task; inspect the provider and remove the state file only after
+confirming that no task was accepted. Once a known task exists, a later run
+resumes status polling instead of submitting again. Terminal tasks clear the
+state file.
 
 Before installing or upgrading the bridge on a runner host, run the local
 prerequisite check as the service account:
@@ -266,22 +286,29 @@ override.
    agent fetches a selected item with
    `tines context show <context-item-id> --json`. The contract and
    issue/workflow block are preserved unchanged.
-3. The bridge submits that prompt to `codex cloud exec` with the selected
-   environment and optional branch. If Tines resolved a model, it is retained
-   in launch metadata; it is not sent as a current Cloud CLI argument or
-   prompt instruction because the command has no per-task model control.
-4. It extracts the returned task URL and polls `codex cloud status` in the
-   foreground. `PENDING` and other recognized in-progress states continue
-   polling; `READY` succeeds and `ERROR` fails.
-5. When the generated prompt contains an issue header and the submission
+3. The bridge writes a prompt-scoped submission intent, then submits that
+   prompt to `codex cloud exec` with the selected environment and optional
+   branch. The command receives the remaining overall deadline.
+4. It extracts the returned task URL, persists it, and polls
+   `codex cloud status` in the foreground. Structured JSON and legacy text
+   statuses are normalized. Transient command failures and malformed responses
+   are retried with bounded exponential backoff; `PENDING` and other
+   recognized in-progress states continue polling; `READY` succeeds and
+   `ERROR` fails.
+5. If the wrapper is interrupted or killed, the state file remains. A known
+   task reference can be resumed without a second `cloud exec`; an interrupted
+   submission remains an explicit recovery stop that refuses automatic replay.
+   The bridge attempts `codex cloud cancel` on timeout or interruption when
+   available, with a separate bounded cleanup timeout.
+6. When the generated prompt contains an issue header and the submission
    returned a URL, the bridge best-effort attaches that URL as the
    bridge-owned `cloud-task` link artifact. It does not attach a task ID as a
    link because Tines link artifacts require an `http(s)` URL.
-6. At a terminal state, the bridge best-effort adds one result comment. JSON or
+7. At a terminal state, the bridge best-effort adds one result comment. JSON or
    labelled status details are reduced to a bounded summary; an `ERROR` state
    without detail is reported explicitly as having no provider reason. A PR
    URL reported by Cloud is included in that comment when available.
-7. The Cloud agent remains responsible for ordinary Tines progress and
+8. The Cloud agent remains responsible for ordinary Tines progress and
    implementation-summary comments, work product artifacts (including the
    required `pr` artifact), and issue transitions using the exported
    credentials. The bridge never fabricates a diff or PR artifact and never
@@ -305,9 +332,6 @@ environment secret is not sufficient.
 
 ## Known limitations and follow-up work
 
-- Status parsing is intentionally simple text matching; transient status
-  failures, retries, timeouts, cancellation, and killed-wrapper recovery are
-  not implemented.
 - Recognized supervisor prompts are adapted by replacing the preamble. Older
   or hand-written prompts without the `## The contract` marker use a
   conservative additive compatibility wrapper instead.

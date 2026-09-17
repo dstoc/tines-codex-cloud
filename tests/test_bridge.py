@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tines_codex_cloud.bridge import (
@@ -670,7 +671,7 @@ Fix the reported behavior.
     def test_poll_rejects_malformed_status(self) -> None:
         fake = FakeCodex([])
         fake.statuses = iter(["not-a-state"])
-        runner = CloudRunner("example", run_command=fake)
+        runner = CloudRunner("example", run_command=fake, status_retries=0)
 
         with self.assertRaisesRegex(CloudCommandError, "no recognized task status"):
             runner.poll("task_123")
@@ -681,3 +682,272 @@ Fix the reported behavior.
 
         with self.assertRaisesRegex(CloudCommandError, "no task URL"):
             runner.submit("prompt")
+
+    def test_status_command_retries_with_exponential_backoff_without_resubmitting(self) -> None:
+        statuses = iter(
+            [
+                subprocess.CompletedProcess(["codex"], 7, "", "temporary"),
+                subprocess.CompletedProcess(["codex"], 8, "", "temporary"),
+                subprocess.CompletedProcess(["codex"], 0, '{"status":"READY"}\n', ""),
+            ]
+        )
+        calls: list[list[str]] = []
+        sleeps: list[float] = []
+
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(args)
+            if args[1:3] == ["cloud", "exec"]:
+                return subprocess.CompletedProcess(args, 0, "Task ID: task_123\n", "")
+            return next(statuses)
+
+        runner = CloudRunner(
+            "example",
+            poll_interval=0,
+            status_retries=2,
+            retry_backoff=0.25,
+            run_command=command,
+            sleep=sleeps.append,
+            output=io.StringIO(),
+        )
+
+        self.assertEqual(runner.run("prompt"), 0)
+        self.assertEqual(calls.count(["codex", "cloud", "exec", "--env", "example", "-" ]), 1)
+        self.assertEqual(sleeps, [0.25, 0.5])
+
+    def test_submission_and_cancellation_commands_receive_bounded_timeouts(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((args, kwargs))
+            if args[1:3] == ["cloud", "exec"]:
+                return subprocess.CompletedProcess(args, 0, "Task ID: task_123\n", "")
+            if args[1:3] == ["cloud", "cancel"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0, '{"status":"READY"}\n', "")
+
+        runner = CloudRunner(
+            "example",
+            timeout=12,
+            cancel_timeout=1.25,
+            run_command=command,
+            output=io.StringIO(),
+        )
+        self.assertEqual(runner.run("prompt"), 0)
+        self.assertTrue(runner.cancel("task_123"))
+
+        self.assertGreater(calls[0][1]["timeout"], 0)
+        self.assertLessEqual(calls[0][1]["timeout"], 12)
+        status_call = next(kwargs for args, kwargs in calls if args[1:3] == ["cloud", "status"])
+        self.assertGreater(status_call["timeout"], 0)
+        cancel_call = next(kwargs for args, kwargs in calls if args[1:3] == ["cloud", "cancel"])
+        self.assertEqual(cancel_call["timeout"], 1.25)
+
+    def test_ambiguous_submission_intent_prevents_duplicate_cloud_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "task.json"
+            first_calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def interrupted_submission(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                first_calls.append((args, kwargs))
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 0))
+
+            first = CloudRunner(
+                "example",
+                timeout=3,
+                state_file=state_file,
+                run_command=interrupted_submission,
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "cloud exec command timed out"):
+                first.run("prompt")
+
+            saved_state = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved_state["phase"], "submitting")
+            self.assertNotIn("task_reference", saved_state)
+
+            second_calls: list[list[str]] = []
+
+            def must_not_resubmit(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                second_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, "Task ID: duplicate\n", "")
+
+            second = CloudRunner(
+                "example",
+                state_file=state_file,
+                run_command=must_not_resubmit,
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "refusing to submit a duplicate"):
+                second.run("prompt")
+            self.assertGreater(first_calls[0][1]["timeout"], 0)
+            self.assertLessEqual(first_calls[0][1]["timeout"], 3)
+            self.assertEqual(second_calls, [])
+
+    def test_timeout_keeps_known_task_state_for_restart_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "task.json"
+            now = [0.0]
+            first_calls: list[list[str]] = []
+
+            def advance(seconds: float) -> None:
+                now[0] += seconds
+
+            def first_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                first_calls.append(args)
+                if args[1:3] == ["cloud", "exec"]:
+                    return subprocess.CompletedProcess(args, 0, "Task ID: task_123\n", "")
+                return subprocess.CompletedProcess(args, 0, '{"status":"PENDING"}\n', "")
+
+            first = CloudRunner(
+                "example",
+                poll_interval=1,
+                timeout=1,
+                status_retries=0,
+                state_file=state_file,
+                run_command=first_command,
+                sleep=advance,
+                monotonic=lambda: now[0],
+                cancel_on_timeout=False,
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "timed out"):
+                first.run("prompt")
+            self.assertEqual(first_calls.count(["codex", "cloud", "exec", "--env", "example", "-"]), 1)
+            self.assertEqual(json.loads(state_file.read_text(encoding="utf-8"))["task_reference"], "task_123")
+
+            resumed_calls: list[list[str]] = []
+
+            def resumed_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                resumed_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, '{"status":"READY"}\n', "")
+
+            resumed = CloudRunner(
+                "example",
+                poll_interval=0,
+                state_file=state_file,
+                run_command=resumed_command,
+                output=io.StringIO(),
+            )
+            self.assertEqual(resumed.run("prompt"), 0)
+            self.assertNotIn(["codex", "cloud", "exec", "--env", "example", "-"], resumed_calls)
+            self.assertFalse(state_file.exists())
+
+    def test_restart_recovery_ignores_volatile_run_header_key_and_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "task.json"
+            now = [0.0]
+            first_calls: list[list[str]] = []
+            first_prompt = """# Supervisor run
+
+This is run arun_1 on runner "cloud-example" for issue demo/7; it times out after 30 minutes.
+
+export TINES_API_KEY=first-ephemeral-key
+
+## Issue: demo/7 — ship it
+
+Context snapshot one.
+"""
+            changed_prompt = """# Supervisor run
+
+This is run arun_2 on runner "cloud-example" for issue demo/7; it times out after 30 minutes.
+
+export TINES_API_KEY=second-ephemeral-key
+
+## Issue: demo/7 — ship it
+
+Context snapshot two, refreshed by Tines.
+"""
+
+            def advance(seconds: float) -> None:
+                now[0] += seconds
+
+            def first_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                first_calls.append(args)
+                if args[1:3] == ["cloud", "exec"]:
+                    return subprocess.CompletedProcess(args, 0, "Task ID: task_123\n", "")
+                return subprocess.CompletedProcess(args, 0, '{"status":"PENDING"}\n', "")
+
+            first = CloudRunner(
+                "example",
+                poll_interval=1,
+                timeout=1,
+                status_retries=0,
+                state_file=state_file,
+                run_command=first_command,
+                sleep=advance,
+                monotonic=lambda: now[0],
+                cancel_on_timeout=False,
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "timed out"):
+                first.run(first_prompt)
+
+            unrelated_calls: list[list[str]] = []
+
+            def unrelated_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                unrelated_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, '{"status":"READY"}\n', "")
+
+            unrelated = CloudRunner(
+                "example",
+                state_file=state_file,
+                run_command=unrelated_command,
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "belongs to a different prompt"):
+                unrelated.run(changed_prompt.replace("demo/7", "other/8"))
+            self.assertEqual(unrelated_calls, [])
+
+            resumed_calls: list[list[str]] = []
+
+            def resumed_command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                resumed_calls.append(args)
+                return subprocess.CompletedProcess(args, 0, '{"status":"READY"}\n', "")
+
+            resumed = CloudRunner(
+                "example",
+                poll_interval=0,
+                state_file=state_file,
+                run_command=resumed_command,
+                output=io.StringIO(),
+            )
+            self.assertEqual(resumed.run(changed_prompt), 0)
+            self.assertNotIn(["codex", "cloud", "exec", "--env", "example", "-"], resumed_calls)
+            self.assertFalse(state_file.exists())
+
+    def test_timeout_cleanup_is_bounded_and_retains_state_when_cancel_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "task.json"
+            now = [0.0]
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def command(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                calls.append((args, kwargs))
+                if args[1:3] == ["cloud", "exec"]:
+                    return subprocess.CompletedProcess(args, 0, "Task ID: task_123\n", "")
+                if args[1:3] == ["cloud", "cancel"]:
+                    return subprocess.CompletedProcess(args, 2, "", "unsupported")
+                return subprocess.CompletedProcess(args, 0, '{"status":"PENDING"}\n', "")
+
+            def advance(seconds: float) -> None:
+                now[0] += seconds
+
+            runner = CloudRunner(
+                "example",
+                poll_interval=1,
+                timeout=1,
+                status_retries=0,
+                state_file=state_file,
+                cancel_timeout=1.5,
+                run_command=command,
+                sleep=advance,
+                monotonic=lambda: now[0],
+                output=io.StringIO(),
+            )
+            with self.assertRaisesRegex(CloudCommandError, "timed out"):
+                runner.run("prompt")
+
+            cancel_call = next(kwargs for args, kwargs in calls if args[1:3] == ["cloud", "cancel"])
+            self.assertEqual(cancel_call["timeout"], 1.5)
+            self.assertTrue(state_file.exists())
+            self.assertIn("remains active", runner.output.getvalue())

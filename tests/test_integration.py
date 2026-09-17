@@ -181,16 +181,16 @@ class FakeCodexIntegrationTests(unittest.TestCase):
         self.assertEqual([record["operation"] for record in records], ["exec"])
         self.assert_no_credentials_in_logs(result)
 
-    def test_transient_status_failure_returns_failure_without_retry_or_leak(self) -> None:
+    def test_transient_status_failure_retries_without_leaking_diagnostics(self) -> None:
         result, records = self.run_bridge("transient-status-failure")
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(
             result.stderr,
-            "error: codex cloud status failed with exit code 17\n",
+            "error: codex cloud status failed with exit code 17 after 4 attempt(s)\n",
         )
         self.assertEqual(result.stdout, "Cloud task submitted; polling until completion.\n")
-        self.assertEqual([record["operation"] for record in records], ["exec", "status"])
+        self.assertEqual([record["operation"] for record in records], ["exec", "status", "status", "status", "status"])
         self.assert_no_credentials_in_logs(result)
 
     def test_submission_process_failure_returns_failure_without_leaking_stderr(self) -> None:
@@ -206,7 +206,7 @@ class FakeCodexIntegrationTests(unittest.TestCase):
         result, records = self.run_bridge("status-process-failure")
 
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stderr, "error: codex cloud status failed with exit code 29\n")
+        self.assertEqual(result.stderr, "error: codex cloud status failed with exit code 29 after 4 attempt(s)\n")
         self.assertEqual(result.stdout, "Cloud task submitted; polling until completion.\n")
-        self.assertEqual([record["operation"] for record in records], ["exec", "status"])
+        self.assertEqual([record["operation"] for record in records], ["exec", "status", "status", "status", "status"])
         self.assert_no_credentials_in_logs(result)

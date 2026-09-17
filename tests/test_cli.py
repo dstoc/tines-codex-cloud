@@ -32,7 +32,7 @@ class CliTests(unittest.TestCase):
         ) as build, patch(
             "tines_codex_cloud.cli.CloudRunner",
             return_value=runner,
-        ):
+        ) as runner_factory:
             status = main(
                 [
                     "run",
@@ -55,6 +55,19 @@ class CliTests(unittest.TestCase):
             repository=None,
             base_branch=None,
             skill_metadata=metadata,
+        )
+        runner_factory.assert_called_once_with(
+            "example",
+            None,
+            5.0,
+            model=None,
+            timeout=1800,
+            status_retries=3,
+            retry_backoff=0.5,
+            state_file="/tmp/prompt.md.cloud-task.json",
+            cancel_timeout=5.0,
+            cancel_on_timeout=True,
+            cancel_on_interrupt=True,
         )
         runner.run.assert_called_once_with("cloud prompt", issue_ref="demo/7")
 
@@ -127,6 +140,13 @@ class CliTests(unittest.TestCase):
             None,
             5.0,
             model="gpt-5.6-sol",
+            timeout=1800,
+            status_retries=3,
+            retry_backoff=0.5,
+            state_file="/tmp/prompt.md.cloud-task.json",
+            cancel_timeout=5.0,
+            cancel_on_timeout=True,
+            cancel_on_interrupt=True,
         )
 
     def test_doctor_reports_checks_and_returns_failure_when_one_is_missing(self) -> None:
