@@ -10,10 +10,11 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import urlsplit
 
 
 class CloudCommandError(RuntimeError):
@@ -97,6 +98,213 @@ class SkillMetadata:
     name: str
     description: str | None
     file_count: int
+
+
+@dataclass(frozen=True)
+class CloudTarget:
+    """The validated Cloud target selected for one Tines run."""
+
+    environment: str
+    repository: str | None = None
+    base_branch: str | None = None
+    project: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudMappingTarget:
+    """A possibly partial target from a mapping file or runner defaults."""
+
+    environment: str | None = None
+    repository: str | None = None
+    base_branch: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudMapping:
+    """Project-to-Cloud mapping loaded from a JSON configuration file.
+
+    ``defaults`` represents the runner's fixed configuration. A project entry
+    overrides a default field, while explicit runner environment/repository
+    flags are treated as constraints and must agree with the selected project.
+    """
+
+    defaults: CloudMappingTarget = CloudMappingTarget()
+    projects: dict[str, CloudMappingTarget] = field(default_factory=dict)
+
+
+def _mapping_string(value: object, field: str, location: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CloudCommandError(f"{location}.{field} must be a non-empty string")
+    value = value.strip()
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise CloudCommandError(f"{location}.{field} must not contain whitespace")
+    return value
+
+
+def _optional_mapping_string(value: object, field: str, location: str) -> str | None:
+    if value is None:
+        return None
+    return _mapping_string(value, field, location)
+
+
+def _mapping_repository(value: object, location: str) -> str | None:
+    repository = _optional_mapping_string(value, "repository", location)
+    if repository is None:
+        return None
+    try:
+        parsed = urlsplit(repository)
+    except ValueError as exc:
+        raise CloudCommandError(
+            f"{location}.repository must be a valid repository URL"
+        ) from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise CloudCommandError(f"{location}.repository must not contain URL credentials")
+    return repository
+
+
+def _mapping_target(value: object, location: str) -> CloudMappingTarget:
+    if not isinstance(value, dict):
+        raise CloudCommandError(f"{location} must be an object")
+    unknown = set(value) - {"environment", "repository", "base_branch"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise CloudCommandError(f"{location} contains unknown field(s): {names}")
+    return CloudMappingTarget(
+        environment=_optional_mapping_string(value.get("environment"), "environment", location),
+        repository=_mapping_repository(value.get("repository"), location),
+        base_branch=_optional_mapping_string(value.get("base_branch"), "base_branch", location),
+    )
+
+
+def load_cloud_mapping(path: str | Path) -> CloudMapping:
+    """Load and validate a project mapping JSON file."""
+
+    mapping_path = Path(path)
+    try:
+        document = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CloudCommandError(f"unable to parse mapping file {mapping_path}: {exc.msg}") from exc
+    except OSError as exc:
+        raise CloudCommandError(
+            f"unable to read mapping file {mapping_path}: {exc.strerror or exc}"
+        ) from exc
+
+    if not isinstance(document, dict):
+        raise CloudCommandError("mapping file must contain a JSON object")
+    unknown = set(document) - {"defaults", "projects"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise CloudCommandError(f"mapping file contains unknown field(s): {names}")
+
+    defaults = _mapping_target(document.get("defaults", {}), "defaults")
+    projects_document = document.get("projects", {})
+    if not isinstance(projects_document, dict):
+        raise CloudCommandError("projects must be an object keyed by Tines project name")
+
+    projects: dict[str, CloudMappingTarget] = {}
+    for project, target in projects_document.items():
+        if not isinstance(project, str) or not project.strip():
+            raise CloudCommandError("projects keys must be non-empty strings")
+        project_name = project.strip()
+        if project_name in projects:
+            raise CloudCommandError(f"projects contains duplicate project {project_name!r}")
+        projects[project_name] = _mapping_target(target, f"projects[{project_name!r}]")
+    return CloudMapping(defaults=defaults, projects=projects)
+
+
+def extract_tines_project(prompt: str) -> str | None:
+    """Extract the project slug from the standard Tines issue heading."""
+
+    match = re.search(r"^##\s+Issue:\s*([^/\s]+)/\d+\b", prompt, flags=re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _repository_identity(repository: str) -> str:
+    """Return a comparison form that ignores URL casing and a trailing .git."""
+
+    parsed = urlsplit(repository)
+    if parsed.scheme:
+        path = parsed.path.rstrip("/")
+        if path.lower().endswith(".git"):
+            path = path[:-4]
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+    if ":" in repository and "@" in repository.split(":", 1)[0]:
+        host, path = repository.split(":", 1)
+        path = path.rstrip("/")
+        if path.lower().endswith(".git"):
+            path = path[:-4]
+        user, _, hostname = host.partition("@")
+        return f"{user}@{hostname.lower()}:{path}"
+    return repository.rstrip("/").removesuffix(".git")
+
+
+def _same_repository(left: str, right: str) -> bool:
+    return _repository_identity(left) == _repository_identity(right)
+
+
+def _selected_project(
+    mapping: CloudMapping,
+    project: str | None,
+) -> tuple[str | None, CloudMappingTarget]:
+    projects = mapping.projects
+    if projects and project is None:
+        raise CloudCommandError(
+            "mapping contains project entries but the Tines project could not be determined; "
+            "pass --project or include a standard '## Issue: <project>/<number>' heading"
+        )
+    if project is not None and projects and project not in projects:
+        raise CloudCommandError(f"no Cloud mapping exists for Tines project {project!r}")
+    return project, projects.get(project, CloudMappingTarget())
+
+
+def resolve_cloud_target(
+    mapping: CloudMapping,
+    *,
+    project: str | None = None,
+    runner_environment: str | None = None,
+    runner_repository: str | None = None,
+    explicit_branch: str | None = None,
+) -> CloudTarget:
+    """Resolve one target using project mapping, runner defaults, and overrides."""
+
+    project, project_values = _selected_project(mapping, project)
+    defaults = mapping.defaults
+
+    mapped_environment = project_values.environment or defaults.environment
+    mapped_repository = project_values.repository or defaults.repository
+    mapped_branch = project_values.base_branch or defaults.base_branch
+
+    if runner_environment is not None:
+        runner_environment = _mapping_string(runner_environment, "environment", "runner")
+        if mapped_environment is not None and runner_environment != mapped_environment:
+            raise CloudCommandError(
+                f"runner environment {runner_environment!r} conflicts with the mapping "
+                f"for project {project or '<default>'!r} ({mapped_environment!r})"
+            )
+    if runner_repository is not None:
+        runner_repository = _mapping_repository(runner_repository, "runner")
+        if mapped_repository is not None and not _same_repository(runner_repository, mapped_repository):
+            raise CloudCommandError(
+                f"runner repository {runner_repository!r} conflicts with the mapping "
+                f"for project {project or '<default>'!r} ({mapped_repository!r})"
+            )
+
+    environment = mapped_environment or runner_environment
+    repository = mapped_repository or runner_repository
+    if environment is None:
+        raise CloudCommandError(
+            "no Cloud environment selected; configure defaults.environment or pass --env"
+        )
+    if explicit_branch is not None:
+        explicit_branch = _mapping_string(explicit_branch, "branch", "command line")
+    branch = explicit_branch or mapped_branch
+
+    if mapping.projects and project is not None and repository is None:
+        raise CloudCommandError(
+            f"Cloud mapping for Tines project {project!r} must select a repository"
+        )
+    return CloudTarget(environment, repository, branch, project)
 
 
 @dataclass(frozen=True)
@@ -338,6 +546,9 @@ def _cloud_preamble(
     *,
     cloud_environment: str | None = None,
     branch: str | None = None,
+    project: str | None = None,
+    repository: str | None = None,
+    base_branch: str | None = None,
     issue_ref: str | None = None,
     skill_metadata: Sequence[SkillMetadata] | None = None,
 ) -> str:
@@ -357,6 +568,28 @@ def _cloud_preamble(
     if branch:
         checkout += f" at the requested branch `{branch}`"
     checkout += "."
+
+    target_lines = [
+        "The bridge selected this Cloud target from validated runner and Tines project configuration.",
+    ]
+    if project is not None:
+        target_lines.append(f"Tines project: `{project}`")
+    if repository is not None:
+        target_lines.extend(
+            [
+                f"Expected repository: `{repository}`",
+                "The Cloud environment must use this expected repository checkout. "
+                "If the checkout does not match, stop and report the mapping error "
+                "instead of editing a different repository.",
+            ]
+        )
+    else:
+        target_lines.append(
+            "The Cloud environment's configured repository is authoritative for this "
+            "legacy runner configuration."
+        )
+    if base_branch is not None:
+        target_lines.append(f"Selected base branch: `{base_branch}`")
 
     return "\n".join(
         [
@@ -378,6 +611,7 @@ def _cloud_preamble(
             "## Workspace",
             "",
             checkout,
+            *target_lines,
             "Work from the current directory. The local Tines runner workspace is not mounted here:",
             "",
             "- `prompt.md`, `repos.json`, and `skills/<name>/…` are not Cloud inputs and must not be expected.",
@@ -401,6 +635,9 @@ def adapt_supervisor_prompt(
     *,
     cloud_environment: str | None = None,
     branch: str | None = None,
+    project: str | None = None,
+    repository: str | None = None,
+    base_branch: str | None = None,
     max_prompt_bytes: int = MAX_CLOUD_PROMPT_BYTES,
     skill_metadata: Sequence[SkillMetadata] | None = None,
 ) -> str:
@@ -427,6 +664,9 @@ def adapt_supervisor_prompt(
             api_key,
             cloud_environment=cloud_environment,
             branch=branch,
+            project=project,
+            repository=repository,
+            base_branch=base_branch,
             issue_ref=issue_ref,
             skill_metadata=skill_metadata,
         )
@@ -434,7 +674,7 @@ def adapt_supervisor_prompt(
         contract = original_prompt[contract_start + 1 :]
         adapted = (
             f"{_cloud_run_header(original_prompt)}\n\n"
-            f"{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch, issue_ref=issue_ref, skill_metadata=skill_metadata)}\n\n"
+            f"{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch, project=project, repository=repository, base_branch=base_branch, issue_ref=issue_ref, skill_metadata=skill_metadata)}\n\n"
             f"{contract}"
         )
 
@@ -450,6 +690,9 @@ def _legacy_cloud_prompt(
     *,
     cloud_environment: str | None = None,
     branch: str | None = None,
+    project: str | None = None,
+    repository: str | None = None,
+    base_branch: str | None = None,
     issue_ref: str | None = None,
     skill_metadata: Sequence[SkillMetadata] | None = None,
 ) -> str:
@@ -458,7 +701,7 @@ def _legacy_cloud_prompt(
     preamble = f"""## tines-codex-cloud compatibility override
 
 You are running as a Codex Cloud task launched by a Tines custom runner.
-{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch, issue_ref=issue_ref, skill_metadata=skill_metadata)}
+{_cloud_preamble(api_url, api_key, cloud_environment=cloud_environment, branch=branch, project=project, repository=repository, base_branch=base_branch, issue_ref=issue_ref, skill_metadata=skill_metadata)}
 The local bridge records the Cloud task URL in the issue's bridge-owned `cloud-task` link artifact and writes the terminal result or failure reason as a comment. Those bookkeeping operations are best effort.
 You own the implementation, tests, progress and implementation-summary
 comments, work product artifacts (including the required PR artifact), and
@@ -479,6 +722,9 @@ def build_cloud_prompt(
     *,
     cloud_environment: str | None = None,
     branch: str | None = None,
+    project: str | None = None,
+    repository: str | None = None,
+    base_branch: str | None = None,
     max_prompt_bytes: int = MAX_CLOUD_PROMPT_BYTES,
     skill_metadata: Sequence[SkillMetadata] | None = None,
 ) -> str:
@@ -490,6 +736,9 @@ def build_cloud_prompt(
         api_key,
         cloud_environment=cloud_environment,
         branch=branch,
+        project=project,
+        repository=repository,
+        base_branch=base_branch,
         max_prompt_bytes=max_prompt_bytes,
         skill_metadata=skill_metadata,
     )

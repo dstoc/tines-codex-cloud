@@ -15,9 +15,10 @@ Tines issue
     │ routing
     ▼
 Tines custom runner
-    │ prompt_file + TINES_API_URL + TINES_API_KEY
+    │ mapping + prompt_file + TINES_API_URL + TINES_API_KEY
     ▼
 tines-codex-cloud
+    ├── resolves the Tines project to a Cloud target
     ├── replaces the local-only preamble with a Cloud compatibility preamble
     ├── gives bounded, on-demand guidance for loading relevant Tines skills
     ├── codex cloud exec --env <environment> [--branch <branch>] -
@@ -29,12 +30,12 @@ tines-codex-cloud
 ```
 
 The Cloud environment owns repository selection and the checkout. The wrapper
-does not clone Tines repository context locally and does not infer an
-environment from the Tines prompt. Tines skill bodies are not copied into the
-Cloud prompt or checkout; the agent fetches selected skills from the Tines CLI
-only when needed. The environment must therefore be configured for the
-repository that the Tines context describes; this bridge does not silently
-select among multiple repositories.
+does not clone Tines repository context locally. An optional mapping file can
+select the environment and expected repository from the Tines project in the
+issue prompt; the expected repository is a checkout guardrail, not a request to
+the Cloud CLI to select a repository. Tines skill bodies are not copied into
+the Cloud prompt or checkout; the agent fetches selected skills from the Tines
+CLI only when needed.
 
 ## Prerequisites
 
@@ -95,17 +96,26 @@ Codex configuration or a service unit.
 
 ```sh
 tines-codex-cloud run \
-  --env example \
+  --config /etc/tines-codex-cloud/mapping.json \
   --prompt-file /path/to/prompt.md \
-  --branch main \
   --model gpt-5.6-sol \
   --poll-interval 5
 ```
 
-`--branch` is optional; omit it when the Cloud environment's configured base
-branch should be used. `--model` is optional and accepts the concrete model
-resolved by Tines for the custom runner. The wrapper requires these environment
-variables:
+`--branch` is optional; omit it when the mapping or Cloud environment's
+configured base branch should be used. For a single fixed environment, the
+backwards-compatible form remains:
+
+```sh
+tines-codex-cloud run \
+  --env example \
+  --repository https://github.com/you/app.git \
+  --prompt-file /path/to/prompt.md \
+  --branch main
+```
+
+`--model` is optional and accepts the concrete model resolved by Tines for the
+custom runner. The wrapper requires these environment variables:
 
 ```text
 TINES_API_URL
@@ -127,6 +137,58 @@ tines-codex-cloud doctor
 This checks the installed `codex` and `tines` executables and the two Codex
 Cloud subcommands without authenticating or submitting a task.
 
+### Target mapping
+
+The optional JSON mapping file describes the Cloud target for each Tines
+project. The `defaults` object is the runner-wide configuration; a project
+entry may override any default field:
+
+```json
+{
+  "defaults": {
+    "environment": "shared-codex-environment",
+    "repository": "https://github.com/you/shared.git",
+    "base_branch": "main"
+  },
+  "projects": {
+    "billing": {
+      "environment": "billing-codex-environment",
+      "repository": "https://github.com/you/billing.git",
+      "base_branch": "trunk"
+    }
+  }
+}
+```
+
+The bridge extracts the project from the standard issue heading:
+
+```text
+## Issue: <project>/<number>
+```
+
+`--project` is available for prompts without that heading and must agree with
+it when both are present. A configured project must resolve to an environment
+and repository; a missing base branch delegates to the Cloud environment's
+default.
+
+Resolution and validation are strict:
+
+1. The selected project entry overrides defaults for environment, repository,
+   and base branch.
+2. `--env` and `--repository` may fill missing mapping values, but a mismatch
+   with a selected mapping fails rather than selecting an ambiguous target.
+   Repository comparison ignores URL casing and a trailing `.git`.
+3. An explicit `--branch` wins over the project entry and defaults and is
+   passed to `codex cloud exec --branch`.
+4. The expected repository is included in the Cloud prompt as a checkout
+   guardrail. The Cloud environment must already be configured with it.
+
+One Tines runner per Cloud environment is the simplest deployment: route a
+project to a command with fixed `--env` and `--repository`, using the mapping
+as a consistency check. Mapping-file mode is preferable when several projects
+share runner capacity or use different Cloud environments; it centralizes the
+decision while still rejecting runner drift.
+
 ## Tines runner configuration
 
 Install the bridge on the runner host, then register a custom runner. The
@@ -136,7 +198,7 @@ Install the bridge on the runner host, then register a custom runner. The
 tines runner install \
   --name cloud-example \
   --harness custom \
-  --command '/path/to/tines-codex-cloud run --env example --prompt-file {prompt_file}'
+  --command '/path/to/tines-codex-cloud run --env example --repository https://github.com/you/app.git --prompt-file {prompt_file}'
 ```
 
 For a foreground process, use the same flags with `tines runner daemon`:
@@ -145,7 +207,7 @@ For a foreground process, use the same flags with `tines runner daemon`:
 tines runner daemon \
   --name cloud-example \
   --harness custom \
-  --command '/path/to/tines-codex-cloud run --env example --prompt-file {prompt_file}'
+  --command '/path/to/tines-codex-cloud run --env example --repository https://github.com/you/app.git --prompt-file {prompt_file}'
 ```
 
 Route this project to the runner with a project-scoped rule:
@@ -157,7 +219,8 @@ tines routing set cloud-example --project tines-codex-cloud
 The runner daemon supplies `TINES_API_URL` and the ephemeral
 `TINES_API_KEY` to the custom command. The bridge passes the prompt file's
 contents to Codex Cloud rather than relying on the local Tines workspace being
-available in Cloud.
+available in Cloud. With `--config`, the runner command can omit `--env` and
+`--repository`; the selected project mapping supplies them.
 
 Custom runners do not have a built-in tier-to-model table, so configure the
 mapping explicitly before using the `{model}` placeholder:
@@ -190,7 +253,9 @@ override.
 
 1. Tines launches the custom command with its generated prompt file and
    ephemeral credentials in the environment.
-2. The bridge recognizes the Tines supervisor envelope and replaces its
+2. The bridge resolves the Tines project against the optional mapping and
+   validates the expected repository before submitting. It then recognizes the
+   Tines supervisor envelope and replaces its
    local-only authentication and workspace sections. For an issue prompt it
    runs `tines issues context <project>/<number> --json` on the runner, keeps
    only each effective skill's safe `item_id`, name, bounded description, and
@@ -256,8 +321,9 @@ environment secret is not sufficient.
   skills, fetch them by context item ID, and keep the selected response bounded
   to 20 files and 100 KiB of UTF-8 content. The complete launch prompt is
   bounded to 256 KiB.
-- Environment, repository, and branch mapping is configured outside the
-  wrapper.
+- Environment, repository, and branch mapping is explicit in the optional JSON
+  configuration; the Cloud environment still owns the actual repository
+  checkout.
 - Result bookkeeping is best effort: a Tines API/CLI outage does not change the
   Cloud task exit code, and a provider's full transcript or diff is not copied
   into Tines. Use the task URL for provider details and the agent-created PR

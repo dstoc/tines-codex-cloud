@@ -4,11 +4,14 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from tines_codex_cloud.bridge import (
     CloudCommandError,
+    CloudMapping,
+    CloudMappingTarget,
     CloudLaunchConfiguration,
     CloudRunner,
     adapt_supervisor_prompt,
@@ -18,10 +21,13 @@ from tines_codex_cloud.bridge import (
     extract_issue_reference,
     extract_pull_request_url,
     extract_task_reference,
+    extract_tines_project,
+    load_cloud_mapping,
     parse_cloud_status,
     parse_skill_metadata,
     fetch_skill_metadata,
     required_tines_environment,
+    resolve_cloud_target,
     SkillMetadata,
 )
 
@@ -251,6 +257,20 @@ Fix the reported behavior.
         self.assertIn("bridge-owned `cloud-task` link artifact", prompt)
         self.assertIn("Do not fabricate a diff or PR artifact", prompt)
 
+    def test_build_cloud_prompt_describes_selected_target(self) -> None:
+        prompt = build_cloud_prompt(
+            "Tines work\n",
+            "https://tines.example/api",
+            "secret",
+            project="billing",
+            repository="https://github.com/example/billing.git",
+            base_branch="main",
+        )
+
+        self.assertIn("Tines project: `billing`", prompt)
+        self.assertIn("Expected repository: `https://github.com/example/billing.git`", prompt)
+        self.assertIn("Selected base branch: `main`", prompt)
+
     def test_build_cloud_prompt_guides_on_demand_skill_loading_without_embedding_files(self) -> None:
         prompt = build_cloud_prompt(
             "## Issue: demo/7 — use the checklist\n",
@@ -388,6 +408,93 @@ Fix the reported behavior.
             "demo/7",
         )
         self.assertIsNone(extract_issue_reference("no issue block"))
+
+    def test_extract_tines_project_reads_standard_issue_heading(self) -> None:
+        self.assertEqual(
+            extract_tines_project("intro\n## Issue: billing/42 — fix it\n"),
+            "billing",
+        )
+        self.assertIsNone(extract_tines_project("no issue heading"))
+
+    def test_mapping_selects_project_and_explicit_branch_has_precedence(self) -> None:
+        with self.subTest("mapping file"):
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "mapping.json")
+                with open(path, "w", encoding="utf-8") as mapping_file:
+                    json.dump(
+                        {
+                            "defaults": {
+                                "environment": "shared-env",
+                                "repository": "https://github.com/example/shared.git",
+                                "base_branch": "main",
+                            },
+                            "projects": {
+                                "billing": {
+                                    "environment": "billing-env",
+                                    "repository": "https://github.com/example/billing.git",
+                                    "base_branch": "trunk",
+                                }
+                            },
+                        },
+                        mapping_file,
+                    )
+                mapping = load_cloud_mapping(path)
+
+        target = resolve_cloud_target(
+            mapping,
+            project="billing",
+            runner_environment="billing-env",
+            runner_repository="https://github.com/example/billing.git",
+            explicit_branch="release/next",
+        )
+        self.assertEqual(target.environment, "billing-env")
+        self.assertEqual(target.repository, "https://github.com/example/billing.git")
+        self.assertEqual(target.base_branch, "release/next")
+        self.assertEqual(target.project, "billing")
+
+    def test_mapping_rejects_runner_environment_or_repository_conflicts(self) -> None:
+        mapping = CloudMapping(
+            projects={
+                "billing": CloudMappingTarget(
+                    environment="billing-env",
+                    repository="https://github.com/example/billing.git",
+                )
+            }
+        )
+        with self.assertRaisesRegex(CloudCommandError, "runner environment"):
+            resolve_cloud_target(mapping, project="billing", runner_environment="other-env")
+        with self.assertRaisesRegex(CloudCommandError, "runner repository"):
+            resolve_cloud_target(
+                mapping,
+                project="billing",
+                runner_repository="https://github.com/example/other.git",
+            )
+
+    def test_mapping_requires_project_selection_when_project_entries_exist(self) -> None:
+        mapping = CloudMapping(
+            projects={
+                "billing": CloudMappingTarget(
+                    environment="billing-env",
+                    repository="https://github.com/example/billing.git",
+                )
+            }
+        )
+        with self.assertRaisesRegex(CloudCommandError, "project could not be determined"):
+            resolve_cloud_target(mapping)
+
+    def test_mapping_rejects_repository_credentials_and_malformed_url(self) -> None:
+        cases = [
+            ("https://user:secret@example.com/repo.git", "URL credentials"),
+            ("https://[invalid/repo", "valid repository URL"),
+        ]
+        for repository, message in cases:
+            with self.subTest(repository=repository), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "mapping.json")
+                with open(path, "w", encoding="utf-8") as mapping_file:
+                    json.dump({"defaults": {"repository": repository}}, mapping_file)
+
+                with self.assertRaisesRegex(CloudCommandError, message):
+                    load_cloud_mapping(path)
 
     def test_parse_cloud_status_preserves_summary_error_and_pr_url(self) -> None:
         status = parse_cloud_status(

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
 from tines_codex_cloud.bridge import PrerequisiteCheck, SkillMetadata
@@ -49,9 +51,43 @@ class CliTests(unittest.TestCase):
             "ephemeral-key",
             cloud_environment="example",
             branch=None,
+            project="demo",
+            repository=None,
+            base_branch=None,
             skill_metadata=metadata,
         )
         runner.run.assert_called_once_with("cloud prompt", issue_ref="demo/7")
+
+    def test_run_reports_malformed_mapping_repository_as_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = f"{directory}/mapping.json"
+            with open(mapping_path, "w", encoding="utf-8") as mapping_file:
+                json.dump({"defaults": {"repository": "https://[invalid/repo"}}, mapping_file)
+
+            error = io.StringIO()
+            with patch(
+                "tines_codex_cloud.cli.required_tines_environment",
+                return_value=("https://tines.example", "ephemeral-key"),
+            ), patch(
+                "tines_codex_cloud.cli.read_prompt",
+                return_value="## Issue: demo/7 — review\n",
+            ), redirect_stderr(error):
+                status = main(
+                    [
+                        "run",
+                        "--config",
+                        mapping_path,
+                        "--prompt-file",
+                        f"{directory}/prompt.md",
+                    ]
+                )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            error.getvalue(),
+            "error: defaults.repository must be a valid repository URL\n",
+        )
+        self.assertNotIn("Traceback", error.getvalue())
 
     def test_run_accepts_tines_resolved_model_and_passes_it_to_cloud_runner(self) -> None:
         runner = Mock()

@@ -9,13 +9,17 @@ from math import isfinite
 from . import __version__
 from .bridge import (
     CloudCommandError,
+    CloudMapping,
     CloudRunner,
     build_cloud_prompt,
     check_prerequisites,
     extract_issue_reference,
+    extract_tines_project,
     fetch_skill_metadata,
+    load_cloud_mapping,
     read_prompt,
     required_tines_environment,
+    resolve_cloud_target,
 )
 
 
@@ -28,7 +32,25 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="submit and poll a Codex Cloud task")
-    run_parser.add_argument("--env", required=True, help="Codex Cloud environment ID or label")
+    run_parser.add_argument(
+        "--env",
+        help="Codex Cloud environment ID or label (or configure it in --config)",
+    )
+    run_parser.add_argument(
+        "--repository",
+        "--repo",
+        dest="repository",
+        help="expected repository URL (or configure it in --config)",
+    )
+    run_parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="JSON file containing Cloud defaults and Tines project mappings",
+    )
+    run_parser.add_argument(
+        "--project",
+        help="Tines project name; otherwise it is read from the issue heading",
+    )
     run_parser.add_argument("--prompt-file", required=True, help="path to the Tines-generated prompt")
     run_parser.add_argument("--branch", help="optional branch for the Cloud task")
     run_parser.add_argument(
@@ -64,6 +86,20 @@ def run_command(args: argparse.Namespace) -> int:
         raise CloudCommandError("--poll-interval must be a finite, non-negative number")
     api_url, api_key = required_tines_environment()
     original_prompt = read_prompt(args.prompt_file)
+    mapping = load_cloud_mapping(args.config) if args.config else CloudMapping()
+    prompt_project = extract_tines_project(original_prompt)
+    if args.project is not None and prompt_project is not None and args.project != prompt_project:
+        raise CloudCommandError(
+            f"--project {args.project!r} conflicts with the prompt's Tines project {prompt_project!r}"
+        )
+    project = args.project or prompt_project
+    target = resolve_cloud_target(
+        mapping,
+        project=project,
+        runner_environment=args.env,
+        runner_repository=args.repository,
+        explicit_branch=args.branch,
+    )
     issue_ref = extract_issue_reference(original_prompt)
     skill_metadata = (
         fetch_skill_metadata(issue_ref, forbidden_values=(api_key,))
@@ -74,11 +110,19 @@ def run_command(args: argparse.Namespace) -> int:
         original_prompt,
         api_url,
         api_key,
-        cloud_environment=args.env,
-        branch=args.branch,
+        cloud_environment=target.environment,
+        branch=target.base_branch,
+        project=target.project,
+        repository=target.repository,
+        base_branch=target.base_branch,
         skill_metadata=skill_metadata,
     )
-    runner = CloudRunner(args.env, args.branch, args.poll_interval, model=args.model)
+    runner = CloudRunner(
+        target.environment,
+        target.base_branch,
+        args.poll_interval,
+        model=args.model,
+    )
     return runner.run(cloud_prompt, issue_ref=issue_ref)
 
 
