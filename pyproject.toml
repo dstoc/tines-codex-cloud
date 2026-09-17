@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tines-codex-cloud"
-version = "0.2.0"
+version = "0.2.1"
 description = "Experimental bridge from a Tines custom runner to Codex Cloud"
 readme = "README.md"
 requires-python = ">=3.11"
