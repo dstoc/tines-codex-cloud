@@ -12,6 +12,16 @@ from tines_codex_cloud.cli import main
 
 
 class CliTests(unittest.TestCase):
+    def test_run_help_describes_issue_and_prompt_state_defaults(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as exit_result:
+            main(["run", "--help"])
+
+        self.assertEqual(exit_result.exception.code, 0)
+        help_text = " ".join(output.getvalue().split())
+        self.assertIn("durable runner-managed state for issue prompts", help_text)
+        self.assertIn("prompt's .cloud-task.json sidecar otherwise", help_text)
+
     def test_run_prefetches_skill_metadata_before_building_cloud_prompt(self) -> None:
         metadata = (SkillMetadata("ctx_review", "review-checklist", "Review it.", 1),)
         runner = Mock()

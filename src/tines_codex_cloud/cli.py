@@ -84,7 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--state-file",
-        help="path for resumable Cloud task state (default: <prompt-file>.cloud-task.json)",
+        help=(
+            "path for resumable Cloud task state (default: durable runner-managed state "
+            "for issue prompts; the prompt's .cloud-task.json sidecar otherwise)"
+        ),
     )
     run_parser.add_argument(
         "--cancel-timeout",
